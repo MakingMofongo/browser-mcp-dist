@@ -6157,8 +6157,10 @@ async function dispatchCore(port, method, params) {
           return info;
         }
 
-        // Get the DOM node ID for the file input
-        const { result: docResult } = await cdpSend(tab.id, 'DOM.getDocument', {});
+        // DOM.getDocument answers with {root}, not with a result wrapper the way
+        // Runtime.evaluate does. Destructuring one as the other left the document
+        // undefined and threw before a single file was ever attached.
+        const docResult = await cdpSend(tab.id, 'DOM.getDocument', {});
         const { nodeId } = await cdpSend(tab.id, 'DOM.querySelector', {
           nodeId: docResult.root.nodeId,
           selector: selector,
