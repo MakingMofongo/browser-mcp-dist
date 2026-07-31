@@ -3305,9 +3305,21 @@ async function requestsSince(tabId, mark) {
   } catch { return null; }
 }
 
-async function dispatch(port, method, params) {
+// Every action goes through here, whether a caller asked for it or a replayed row
+// is working through its steps. That is the point of it existing.
+//
+// There were two ways in: callers came through dispatch, and replayed steps went
+// straight to dispatchCore, which skips everything dispatch wraps around an
+// action. Three separate checks were built on top of dispatch and were therefore
+// dead during replay — the request capture, the shape comparison, and the record
+// of what a row wrote, which two more checks read from. Each had passing tests,
+// because tests drive the tools the way a caller does. Each was found by
+// accident, and the fourth would have been too.
+//
+// So there is one implementation now and both ways in call it. Anything added
+// here applies to unattended runs without anybody remembering that it has to.
+async function runAction(port, method, params, opts = {}) {
   const started = Date.now();
-  const rec = recording.get(port);
 
   let tabId = null, mark = null;
   if (COMMITTING.has(method)) {
@@ -3315,7 +3327,9 @@ async function dispatch(port, method, params) {
     if (tabId) mark = await requestMark(tabId);
   }
 
-  const result = await dispatchInner(port, method, params);
+  const result = opts.core
+    ? await dispatchCore(port, method, params)
+    : await dispatchInner(port, method, params);
 
   // Reported, not judged. A page that autosaves, searches as you type or posts
   // analytics fires these constantly, so treating any of them as a fault would
@@ -3333,13 +3347,19 @@ async function dispatch(port, method, params) {
     }
   }
 
+  await trackWrite(port, method, params, result);
+  noteCall(port, method, Date.now() - started, result);
+  return result;
+}
+
+async function dispatch(port, method, params) {
+  const rec = recording.get(port);
+  const result = await runAction(port, method, params);
   // Recorded after the requests have been attached, not before. Taking the step
   // down first captured everything except the part the comparison needs, so a
-  // recorded flow could never know which requests were normal for it.
+  // recorded flow could never know which requests were normal for it. Only a
+  // caller's actions are recorded — a replay is following a flow, not writing one.
   if (rec && RECORDABLE.has(method)) await recordStep(port, method, params, result).catch(() => {});
-
-  noteCall(port, method, Date.now() - started, result);
-  await trackWrite(port, method, params, result);
   return result;
 }
 
@@ -5564,23 +5584,10 @@ async function dispatchCore(port, method, params) {
         // Replayed steps go through dispatchCore, which skips the request capture
         // that dispatch does — so without this the comparison would have nothing
         // to compare and would quietly never fire.
-        let stepMark = null, stepTab = null;
-        if (COMMITTING.has(step.method)) {
-          try { stepTab = (await getSessionTab(port)).id; stepMark = await requestMark(stepTab); } catch {}
-        }
-        try { out = await dispatchCore(port, step.method, p); }
+        // The same path a caller's action takes, so a check added to one is a
+        // check added to both.
+        try { out = await runAction(port, step.method, p, { core: true }); }
         catch (e) { out = { ok: false, error: e?.message || String(e) }; }
-        if (stepMark != null && out && typeof out === 'object') {
-          await new Promise(r => setTimeout(r, 250));
-          const fired = await requestsSince(stepTab, stepMark);
-          const mutating = (fired || []).filter(q => MUTATING_VERB.test(q.method));
-          if (mutating.length) out.sent = mutating.slice(0, 6).map(q => `${q.method} ${q.url}` + (q.status ? ` → ${q.status}` : ''));
-        }
-        // Replayed steps bypass dispatch, so without this nothing records what the
-        // row wrote — and the two checks that exist for unattended runs both read
-        // from that record. The blank-save guard and the payload reconciliation
-        // were silently inert during exactly the runs they were built for.
-        await trackWrite(port, step.method, p, out);
         results.push({ step: i, method: step.method, ok: out?.ok !== false, value: p.value });
 
         // Escalate on divergence rather than ploughing on into a wrong page.
