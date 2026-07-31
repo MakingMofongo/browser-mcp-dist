@@ -7749,6 +7749,14 @@ async function dispatchCore(port, method, params) {
         // One machine here sat on a version from before a week of work without
         // anything ever saying so.
         extension_version: chrome.runtime.getManifest().version,
+        // An install with no update address will never update, whatever the
+        // channel publishes, and nothing about it looks wrong from the outside —
+        // it answers every command while running whatever it was installed with.
+        // One machine sat like that for nine days and fifty versions, checking for
+        // updates the whole time against an address it did not have.
+        ...(chrome.runtime.getManifest().update_url ? {} : {
+          updates_disabled: 'this build has no update address in its manifest, so Chrome will never update it however often it checks — it has to be reinstalled once from the channel, after which it keeps itself current',
+        }),
         ready: scriptingOk,
         // Whether real input can be delivered to this window at all. It changes
         // which path every click and keystroke takes, and it is the difference
