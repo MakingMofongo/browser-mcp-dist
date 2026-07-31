@@ -5035,11 +5035,31 @@ async function dispatchCore(port, method, params) {
           };
         }
 
+        // Whether this flow ends with something identifying what it created. Only
+        // a flow that produced one on a clean run is expected to produce one per
+        // row — a sign-in has nothing to confirm, and demanding a reference from
+        // every flow would mark most rows unconfirmed for ever, which trains
+        // people to ignore the one case that matters.
+        let yieldsReference = false;
+        try {
+          const tab = await getSessionTab(port);
+          const [c] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, world: 'MAIN',
+            func: () => {
+              if ((window.__bmcpConfirmations || []).length) return true;
+              const t = (document.body?.innerText || '').replace(/\s+/g, ' ');
+              return /(?:[Cc]onfirmation|[Rr]eference|[Aa]pplication|[Rr]eceipt|[Oo]rder|[Tt]racking)\s*(?:[Ii][Dd]|[Nn]umber|[Nn]o\.?|#)?\s*[:#]\s*[A-Z0-9][A-Z0-9-]{3,24}/.test(t);
+            },
+          });
+          yieldsReference = c?.result === true;
+        } catch {}
+
         flows[rec.name] = {
           steps,
           start_url: flows[rec.name]?.start_url || rec.start_url,
           saved: new Date().toISOString(),
           passes: (flows[rec.name]?.passes || 0) + 1,
+          yields_reference: yieldsReference || flows[rec.name]?.yields_reference || false,
         };
         await chrome.storage.local.set({ bmcpFlows: flows });
         return {
@@ -5119,7 +5139,13 @@ async function dispatchCore(port, method, params) {
         await persist();
         let stopped = null, authWall = null;
         for (const entry of ledger.rows) {
+          // submitted_unconfirmed is deliberately not retried. The flow ran to the
+          // end, so the likeliest thing is that it worked and the page simply said
+          // nothing identifying — running it again to find out is how one
+          // submission becomes two. retry_committed re-runs it for someone who has
+          // checked the site and knows it did not land.
           if (entry.status === 'done' || entry.status === 'skipped') continue;
+          if (entry.status === 'submitted_unconfirmed' && !params.retry_committed) continue;
           if (entry.status === 'in_progress' && !params.retry_committed) {
             // The worker stopped while this row was running — Chrome evicts an idle
             // service worker, and a long run is exactly that workload. Whether it
@@ -5175,11 +5201,28 @@ async function dispatchCore(port, method, params) {
                   return m ? { value: m[0].slice(0, 60), from: 'read from the page' } : null;
                 },
               });
-              if (c?.result?.value) {
+              // A receipt only counts if it belongs to this row. Portals leave the
+              // previous confirmation on screen, and a matcher that reads it again
+              // marks every later row done on the strength of the first one's
+              // receipt — which is worse than capturing nothing, because it looks
+              // like proof.
+              const already = new Set(ledger.rows.filter(x => x !== entry && x.confirmation).map(x => x.confirmation));
+              if (c?.result?.value && !already.has(c.result.value)) {
                 entry.confirmation = c.result.value;
                 entry.confirmation_source = c.result.from;
+              } else if (c?.result?.value) {
+                entry.confirmation_note = 'the page was still showing the previous row\'s reference, so it was not taken as this row\'s';
               }
             } catch {}
+            // The step succeeded, but nothing came back that identifies what was
+            // created. That is not the same as knowing it landed, and calling it
+            // done is how a run reports two hundred successes that nobody can
+            // check. Resume leaves these alone rather than re-running them, since
+            // a second attempt is how one submission becomes two.
+            if (!entry.confirmation && flow.yields_reference) {
+              entry.status = 'submitted_unconfirmed';
+              entry.note = 'this flow gave a reference when it was recorded and gave none for this row, so whether it was recorded cannot be confirmed from here. Check the site before re-running it — resume will not.';
+            }
           } else {
             entry.status = kind === 'structural' ? 'failed' : 'skipped';
             entry.kind = kind;
@@ -5226,6 +5269,18 @@ async function dispatchCore(port, method, params) {
           flow: params.name,
           rows_total: ledger.rows.length,
           ...counts,
+          // Said plainly rather than left in the counts. A run that reports two
+          // hundred done and eleven unconfirmed is a different night from one that
+          // reports two hundred and eleven done, and the difference is exactly the
+          // rows somebody has to go and look at.
+          ...(counts.submitted_unconfirmed ? {
+            unconfirmed: ledger.rows.filter(r => r.status === 'submitted_unconfirmed')
+              .map(r => ({ row_index: r.index, row: r.row })),
+            unconfirmed_note: `${counts.submitted_unconfirmed} row${counts.submitted_unconfirmed > 1 ? 's' : ''} ran to the end without the page giving a reference, so whether they were recorded cannot be told from here. Resume leaves them alone — check the site, then re-run those rows with retry_committed if they did not land.`,
+          } : {}),
+          ...(ledger.rows.some(r => r.confirmation) ? {
+            confirmations: ledger.rows.filter(r => r.confirmation).map(r => ({ row_index: r.index, reference: r.confirmation })),
+          } : {}),
           failures: failures.length ? failures : undefined,
           ...(stopped && authWall ? {
             paused_at_row: stopped.index,
