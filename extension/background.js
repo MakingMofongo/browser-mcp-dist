@@ -944,13 +944,13 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
       if (cands.length > 1 && meta.anchor) {
         const anch = (el2) => {
           const fs = el2.closest && el2.closest('fieldset');
-          if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/s+/g, ' ').slice(0, 60); }
-          const sec = el2.closest && el2.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+          if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/\s+/g, ' ').slice(0, 60); }
+          const sec = el2.parentElement && el2.parentElement.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
           if (sec) {
             const al = sec.getAttribute && sec.getAttribute('aria-label');
             if (al) return al.trim().slice(0, 60);
             const cell = sec.querySelector && sec.querySelector('th, td, [role="rowheader"]');
-            if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/s+/g, ' ').slice(0, 60);
+            if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/\s+/g, ' ').slice(0, 60);
           }
           return null;
         };
@@ -1555,7 +1555,11 @@ function bmcpResolveRef(key) {
     const anchorOf = (e) => {
       const fs = e.closest && e.closest('fieldset');
       if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/\s+/g, ' ').slice(0, 60); }
-      const sec = e.closest && e.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+      // Starts at the parent on purpose. closest() considers the element itself,
+      // and a labelled input is its own nearest [aria-label] — so every field in
+      // every row anchored to its own label, every anchor came out identical, and
+      // the check that exists to tell two rows apart could never tell them apart.
+      const sec = e.parentElement && e.parentElement.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
       if (sec) {
         const al = sec.getAttribute && sec.getAttribute('aria-label');
         if (al) return al.trim().slice(0, 60);
@@ -6877,13 +6881,17 @@ async function dispatchCore(port, method, params) {
               // re-identifying by index alone lands confidently on the wrong record.
               const anchorOf = (e) => {
                 const fs = e.closest && e.closest('fieldset');
-                if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/s+/g, ' ').slice(0, 60); }
-                const sec = e.closest && e.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+                if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/\s+/g, ' ').slice(0, 60); }
+                // Starts at the parent on purpose. closest() considers the element itself,
+      // and a labelled input is its own nearest [aria-label] — so every field in
+      // every row anchored to its own label, every anchor came out identical, and
+      // the check that exists to tell two rows apart could never tell them apart.
+      const sec = e.parentElement && e.parentElement.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
                 if (sec) {
                   const al = sec.getAttribute && sec.getAttribute('aria-label');
                   if (al) return al.trim().slice(0, 60);
                   const cell = sec.querySelector && sec.querySelector('th, td, [role="rowheader"]');
-                  if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/s+/g, ' ').slice(0, 60);
+                  if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/\s+/g, ' ').slice(0, 60);
                 }
                 return null;
               };
@@ -7026,13 +7034,17 @@ async function dispatchCore(port, method, params) {
               // re-identifying by index alone lands confidently on the wrong record.
               const anchorOf = (e) => {
                 const fs = e.closest && e.closest('fieldset');
-                if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/s+/g, ' ').slice(0, 60); }
-                const sec = e.closest && e.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+                if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/\s+/g, ' ').slice(0, 60); }
+                // Starts at the parent on purpose. closest() considers the element itself,
+      // and a labelled input is its own nearest [aria-label] — so every field in
+      // every row anchored to its own label, every anchor came out identical, and
+      // the check that exists to tell two rows apart could never tell them apart.
+      const sec = e.parentElement && e.parentElement.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
                 if (sec) {
                   const al = sec.getAttribute && sec.getAttribute('aria-label');
                   if (al) return al.trim().slice(0, 60);
                   const cell = sec.querySelector && sec.querySelector('th, td, [role="rowheader"]');
-                  if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/s+/g, ' ').slice(0, 60);
+                  if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/\s+/g, ' ').slice(0, 60);
                 }
                 return null;
               };
@@ -7154,13 +7166,17 @@ async function dispatchCore(port, method, params) {
               // re-identifying by index alone lands confidently on the wrong record.
               const anchorOf = (e) => {
                 const fs = e.closest && e.closest('fieldset');
-                if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/s+/g, ' ').slice(0, 60); }
-                const sec = e.closest && e.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+                if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/\s+/g, ' ').slice(0, 60); }
+                // Starts at the parent on purpose. closest() considers the element itself,
+      // and a labelled input is its own nearest [aria-label] — so every field in
+      // every row anchored to its own label, every anchor came out identical, and
+      // the check that exists to tell two rows apart could never tell them apart.
+      const sec = e.parentElement && e.parentElement.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
                 if (sec) {
                   const al = sec.getAttribute && sec.getAttribute('aria-label');
                   if (al) return al.trim().slice(0, 60);
                   const cell = sec.querySelector && sec.querySelector('th, td, [role="rowheader"]');
-                  if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/s+/g, ' ').slice(0, 60);
+                  if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/\s+/g, ' ').slice(0, 60);
                 }
                 return null;
               };
