@@ -4144,7 +4144,9 @@ async function dispatchCore(port, method, params) {
       // and the command then never returns. It is worth trying and never worth
       // waiting on, so it runs under a deadline and the reliable path follows.
       let usedWheel = false;
+      const scrollWin = (await chrome.tabs.get(tab.id).catch(() => null))?.windowId;
       try {
+        if (trustedInputLikelyDead(scrollWin)) throw new Error('trusted-input-unavailable');
         await debuggerAttach(tab.id);
         const steps = Math.max(1, Math.min(20, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 300)));
         await Promise.race([
@@ -4160,7 +4162,12 @@ async function dispatchCore(port, method, params) {
           new Promise((_, rej) => setTimeout(() => rej(new Error('wheel-timeout')), 2500)),
         ]);
         await new Promise(r => setTimeout(r, 300));
-      } catch { /* falls through to the scripting path below */ }
+        noteTrustedInputWorked(scrollWin);
+      } catch (e) {
+        // Remembered so the next scroll goes straight to the stepped path rather
+        // than waiting on the wheel again.
+        if (String(e?.message || e).includes('trusted-input') || String(e?.message || e).includes('wheel-timeout')) noteTrustedInputFailed(scrollWin);
+      }
 
       let after = await readPos();
       let moved = startedAt && after ? after.y - startedAt.y : null;
@@ -4266,17 +4273,71 @@ async function dispatchCore(port, method, params) {
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       const el = await resolveElement(tab.id, params.selector);
       if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
-      await debuggerAttach(tab.id);
       const { x, y } = el;
-      await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-      await new Promise(r => setTimeout(r, 30));
-      // Proper dblclick: two press/release pairs with escalating clickCount.
-      await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
-      await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
-      await new Promise(r => setTimeout(r, 40));
-      await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 2 });
-      await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 2 });
-      return { ok: true, double_clicked: true, tag: el.tag, text: el.text };
+      // A dblclick is synthesized by the browser from two press/release pairs, and
+      // a window that is not in front never synthesizes it — the individual mouse
+      // events arrive, the dblclick does not. This reported success and fired
+      // nothing at all. Watch for the event, and dispatch one directly when the
+      // real path produced none.
+      await safeExecuteScript(tab.id, (px, py) => {
+        window.__bmcpDbl = 0;
+        try { document.removeEventListener('dblclick', window.__bmcpDblSpy, true); } catch (e) {}
+        window.__bmcpDblSpy = () => { window.__bmcpDbl++; };
+        document.addEventListener('dblclick', window.__bmcpDblSpy, true);
+      }, [x, y]);
+
+      const winId = (await chrome.tabs.get(tab.id).catch(() => null))?.windowId;
+      if (!trustedInputLikelyDead(winId)) {
+        try {
+          await debuggerAttach(tab.id);
+          await Promise.race([
+            (async () => {
+              await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+              await new Promise(r => setTimeout(r, 30));
+              // Proper dblclick: two press/release pairs with escalating clickCount.
+              await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
+              await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
+              await new Promise(r => setTimeout(r, 40));
+              await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 2 });
+              await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 2 });
+            })(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('trusted-input-unavailable')), TRUSTED_PROBE_MS)),
+          ]);
+          noteTrustedInputWorked(winId);
+        } catch { noteTrustedInputFailed(winId); }
+      }
+
+      const outcome = await safeExecuteScript(tab.id, (sel, px, py) => {
+        const seen = window.__bmcpDbl || 0;
+        const done = () => {
+          try { document.removeEventListener('dblclick', window.__bmcpDblSpy, true); } catch (e) {}
+          const n = window.__bmcpDbl || 0;
+          try { delete window.__bmcpDbl; delete window.__bmcpDblSpy; } catch (e) {}
+          return n;
+        };
+        if (seen > 0) return { path: 'trusted', fired: done() };
+        let el = null;
+        const rm = /^ref[_=](\d+)$/.exec(sel || '');
+        if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+        if (!el) { try { el = document.querySelector(sel); } catch (e) {} }
+        if (!el) el = document.elementFromPoint(px, py);
+        if (!el) return { path: 'none', fired: done() };
+        const o = { bubbles: true, cancelable: true, composed: true, view: window, clientX: px, clientY: py };
+        el.dispatchEvent(new MouseEvent('mousedown', { ...o, detail: 1 }));
+        el.dispatchEvent(new MouseEvent('mouseup', { ...o, detail: 1 }));
+        el.dispatchEvent(new MouseEvent('click', { ...o, detail: 1 }));
+        el.dispatchEvent(new MouseEvent('mousedown', { ...o, detail: 2 }));
+        el.dispatchEvent(new MouseEvent('mouseup', { ...o, detail: 2 }));
+        el.dispatchEvent(new MouseEvent('click', { ...o, detail: 2 }));
+        el.dispatchEvent(new MouseEvent('dblclick', { ...o, detail: 2 }));
+        return { path: 'synthetic', fired: done() };
+      }, [params.selector, x, y]);
+
+      const r = outcome?.result;
+      if (!r || !r.fired) {
+        return { ok: false, tag: el.tag, text: el.text, error: 'No dblclick event reached the page. The element may be covered, or inside a frame this cannot reach.' };
+      }
+      return { ok: true, double_clicked: true, tag: el.tag, text: el.text, path: r.path, verified: true };
     }
 
     case 'right_click': {
@@ -5658,17 +5719,44 @@ async function dispatchCore(port, method, params) {
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       const el = await resolveElement(tab.id, params.selector);
       if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
-      await debuggerAttach(tab.id);
-      try {
-        await cdpSend(tab.id, 'Input.dispatchMouseEvent', {
-          type: 'mouseMoved', x: el.x, y: el.y,
-        });
-        // Hold hover for duration (default 500ms) so menus/tooltips appear
-        await new Promise(r => setTimeout(r, params.duration || 500));
-      } finally {
-        await debuggerDetach(tab.id);
+      // A real mouse move does arrive at a background window, but only after the
+      // compositor gives up waiting — about four seconds for something that has
+      // to happen before most menus will open. The synthetic events produce the
+      // same hover on anything driven by JavaScript, so the real move is skipped
+      // once this window has shown it cannot deliver one promptly.
+      const winId = (await chrome.tabs.get(tab.id).catch(() => null))?.windowId;
+      let path = 'synthetic';
+      if (!trustedInputLikelyDead(winId)) {
+        try {
+          await debuggerAttach(tab.id);
+          await Promise.race([
+            cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: el.x, y: el.y }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('trusted-input-unavailable')), TRUSTED_PROBE_MS)),
+          ]);
+          noteTrustedInputWorked(winId);
+          path = 'trusted';
+        } catch { noteTrustedInputFailed(winId); }
+        finally { await debuggerDetach(tab.id).catch(() => {}); }
       }
-      return { ok: true, tag: el.tag, text: el.text };
+      if (path === 'synthetic') {
+        await safeExecuteScript(tab.id, (sel, px, py) => {
+          let el = null;
+          const rm = /^ref[_=](\d+)$/.exec(sel || '');
+          if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+          if (!el) { try { el = document.querySelector(sel); } catch (e) {} }
+          if (!el) el = document.elementFromPoint(px, py);
+          if (!el) return false;
+          const o = { bubbles: true, cancelable: true, composed: true, view: window, clientX: px, clientY: py };
+          try { el.dispatchEvent(new PointerEvent('pointerover', o)); el.dispatchEvent(new PointerEvent('pointerenter', o)); } catch (e) {}
+          el.dispatchEvent(new MouseEvent('mouseover', o));
+          el.dispatchEvent(new MouseEvent('mouseenter', { ...o, bubbles: false }));
+          el.dispatchEvent(new MouseEvent('mousemove', o));
+          return true;
+        }, [params.selector, el.x, el.y]);
+      }
+      // Held so menus and tooltips have time to open before the next call looks.
+      await new Promise(r => setTimeout(r, params.duration || 500));
+      return { ok: true, tag: el.tag, text: el.text, path };
     }
 
     case 'select_option': {
