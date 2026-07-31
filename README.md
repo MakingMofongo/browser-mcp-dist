@@ -3,7 +3,7 @@
 Chrome polls `updates.xml` here and installs `browser-mcp.crx`.
 
 - Extension ID: `apcaminghehhiafleljmdhjhfimndngf`
-- Current version: `2.4.3`
+- Current version: `2.4.4`
 
 Install (no admin needed):
 

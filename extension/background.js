@@ -818,7 +818,31 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
   const resolve = (sel) => {
     if (!sel) return null;
     const rm = /^ref[_=](\d+)$/.exec(sel);
-    if (rm) { const e = window.__bmcpRefEls && window.__bmcpRefEls['ref_' + rm[1]]; return (e && e.isConnected) ? e : null; }
+    if (rm) {
+      const key = 'ref_' + rm[1];
+      let e = window.__bmcpRefEls && window.__bmcpRefEls[key];
+      if (e && e.isConnected) return e;
+      // Re-identify a node the framework replaced, rather than failing the fill.
+      const meta = (window.__bmcpRefMeta || {})[key];
+      if (!meta) return null;
+      const nm = (x) => {
+        const a = x.getAttribute && x.getAttribute('aria-label');
+        if (a) return a.trim();
+        if (x.labels && x.labels[0]) return x.labels[0].textContent.trim().replace(/\s+/g, ' ');
+        if (x.placeholder) return x.placeholder.trim();
+        const t = (x.textContent || '').trim().replace(/\s+/g, ' ');
+        return t ? t.slice(0, 80) : (x.name || x.id || '');
+      };
+      const cands = walkAll(document, []).filter(x =>
+        x.tagName === meta.tag &&
+        (meta.type ? (x.type || '').toLowerCase() === meta.type : true) &&
+        nm(x) === meta.name);
+      if (!cands.length) return null;
+      e = cands[Math.min(meta.idx || 0, cands.length - 1)];
+      window.__bmcpRefEls[key] = e;
+      window.__bmcpRefHealed = key;
+      return e;
+    }
     const tm = /^(\w+):text\((.+)\)$/.exec(sel);
     if (tm || sel.startsWith('text=')) {
       const needle = (tm ? tm[2] : sel.slice(5)).trim();
@@ -1238,27 +1262,63 @@ function parseSelector(selector) {
 
 // Locate a ref-handle element (assigned by read_page/find) and return its center.
 // Runs as a serialized function in MAIN world — page CSP cannot block it.
+//
+// Reactive frameworks (LWC, Angular Material, React) replace subtrees on every
+// input event, so a ref captured moments earlier can point at a detached node.
+// Failing there forces a re-read between every single action. Instead each ref
+// carries a fingerprint — role, accessible name, tag and its index among
+// same-looking elements — and a stale ref is re-resolved from that. The element is
+// identified by what it IS, not by the object it happened to be.
+function bmcpResolveRef(key) {
+  const refs = window.__bmcpRefEls || {};
+  const meta = (window.__bmcpRefMeta || {})[key];
+  let el = refs[key];
+  let healed = false;
+
+  if ((!el || !el.isConnected) && meta) {
+    const nameOf = (e) => {
+      const a = e.getAttribute && e.getAttribute('aria-label');
+      if (a) return a.trim();
+      if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+      if (e.placeholder) return e.placeholder.trim();
+      const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+      if (t) return t.slice(0, 80);
+      return e.name || e.id || '';
+    };
+    const all = [];
+    const walk = (root) => {
+      for (const e of root.querySelectorAll('*')) { all.push(e); if (e.shadowRoot) walk(e.shadowRoot); }
+    };
+    walk(document);
+    const sameKind = all.filter(e =>
+      e.tagName === meta.tag &&
+      (meta.type ? (e.type || '').toLowerCase() === meta.type : true) &&
+      nameOf(e) === meta.name);
+    if (sameKind.length) {
+      el = sameKind[Math.min(meta.idx || 0, sameKind.length - 1)];
+      healed = true;
+      refs[key] = el;
+    }
+  }
+
+  if (!el) return { error: meta ? 'stale-ref' : 'unknown-ref' };
+  if (!el.isConnected) return { error: 'stale-ref' };
+  el.scrollIntoView({ block: 'center', behavior: 'instant' });
+  const rect = el.getBoundingClientRect();
+  return {
+    x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
+    tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80), found: true, healed,
+  };
+}
+
 async function resolveRefElement(tabId, refKey) {
   const r = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: 'MAIN',
-    func: (key) => {
-      const el = window.__bmcpRefEls && window.__bmcpRefEls[key];
-      if (!el) return { error: 'unknown-ref' };
-      if (!el.isConnected) return { error: 'stale-ref' };
-      el.scrollIntoView({ block: 'center', behavior: 'instant' });
-      const rect = el.getBoundingClientRect();
-      return {
-        x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
-        tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80), found: true,
-      };
-    },
-    args: [refKey],
+    target: { tabId }, world: 'MAIN', func: bmcpResolveRef, args: [refKey],
   });
   const res = r?.[0]?.result;
   if (!res || res.error) {
     throw new Error(res?.error === 'stale-ref'
-      ? `Ref ${refKey} is stale — the element left the DOM (page navigated or re-rendered). Re-run browser_read_page or browser_find to get fresh refs.`
+      ? `Ref ${refKey} no longer matches anything on the page — it was replaced and could not be re-identified by role, name or position. Re-run browser_read_page or browser_find.`
       : `Unknown ref ${refKey} on this page. Run browser_read_page or browser_find first (refs are per-page and reset on navigation).`);
   }
   return res;
@@ -2256,6 +2316,85 @@ async function dropFileOnTarget(tabId, selector, files) {
 
 // ── Command Dispatcher ──────────────────────────────────────────────────────
 
+// ── Flow recording and replay ──────────────────────────────────────────────
+// A recorded step must survive a fresh page load, so the target is stored as a
+// durable identity (id, name attribute, or role + accessible name + index) rather
+// than a ref number, which is only meaningful within one page instance.
+
+function bmcpPortableTarget(selector) {
+  const deepQ = (root, s) => {
+    let el = null;
+    try { el = root.querySelector(s); } catch (e) { return null; }
+    if (el) return el;
+    for (const n of root.querySelectorAll('*')) if (n.shadowRoot) { const f = deepQ(n.shadowRoot, s); if (f) return f; }
+    return null;
+  };
+  const walkAll = (root, out) => {
+    for (const e of root.querySelectorAll('*')) { out.push(e); if (e.shadowRoot) walkAll(e.shadowRoot, out); }
+    return out;
+  };
+  const nm = (e) => {
+    const a = e.getAttribute && e.getAttribute('aria-label');
+    if (a) return a.trim();
+    if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+    if (e.placeholder) return e.placeholder.trim();
+    const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+    return t ? t.slice(0, 80) : (e.name || e.id || '');
+  };
+  let el = null;
+  const rm = /^ref[_=](\d+)$/.exec(selector || '');
+  if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+  else if (selector && (selector.startsWith('text=') || /^\w+:text\(/.test(selector))) {
+    const tm = /^(\w+):text\((.+)\)$/.exec(selector);
+    const needle = (tm ? tm[2] : selector.slice(5)).trim();
+    const want = tm ? tm[1].toUpperCase() : null;
+    const all = walkAll(document, []);
+    const m = all.filter(e => (!want || e.tagName === want) && (e.textContent || '').trim().includes(needle));
+    el = m.filter(e => !m.some(o => o !== e && e.contains && e.contains(o)))[0] || m[0] || null;
+  } else if (selector) el = deepQ(document, selector);
+  if (!el || !el.isConnected) return null;
+
+  const name = nm(el);
+  const peers = walkAll(document, []).filter(p => p.tagName === el.tagName && nm(p) === name);
+  return {
+    css: el.id ? '#' + CSS.escape(el.id)
+       : (el.getAttribute('name') ? `${el.tagName.toLowerCase()}[name="${el.getAttribute('name')}"]` : null),
+    tag: el.tagName,
+    type: (el.type || '').toLowerCase(),
+    name,
+    idx: Math.max(0, peers.indexOf(el)),
+    label_source: el.getAttribute('aria-label') ? 'aria-label' : (el.labels && el.labels[0] ? 'label' : 'text'),
+  };
+}
+
+// Turn a stored identity back into a live element on whatever page is loaded now.
+function bmcpResolvePortable(t) {
+  const walkAll = (root, out) => {
+    for (const e of root.querySelectorAll('*')) { out.push(e); if (e.shadowRoot) walkAll(e.shadowRoot, out); }
+    return out;
+  };
+  const nm = (e) => {
+    const a = e.getAttribute && e.getAttribute('aria-label');
+    if (a) return a.trim();
+    if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+    if (e.placeholder) return e.placeholder.trim();
+    const x = (e.textContent || '').trim().replace(/\s+/g, ' ');
+    return x ? x.slice(0, 80) : (e.name || e.id || '');
+  };
+  if (t.css) {
+    try { const el = document.querySelector(t.css); if (el) return { found: true, css: t.css }; } catch (e) {}
+  }
+  const cands = walkAll(document, []).filter(e =>
+    e.tagName === t.tag && (t.type ? (e.type || '').toLowerCase() === t.type : true) && nm(e) === t.name);
+  if (!cands.length) return { found: false, tried: t };
+  const el = cands[Math.min(t.idx || 0, cands.length - 1)];
+  // Hand back a one-shot ref so the caller can act on exactly this element.
+  if (!window.__bmcpRefEls) { window.__bmcpRefEls = {}; window.__bmcpRefSeq = 0; }
+  const key = 'ref_' + (++window.__bmcpRefSeq);
+  window.__bmcpRefEls[key] = el;
+  return { found: true, ref: key, ambiguous: cands.length > 1 ? cands.length : undefined };
+}
+
 // ── Structured extraction ──────────────────────────────────────────────────
 // Injected whole (chrome.scripting does not serialise closures). Prefers a real
 // <table>; otherwise infers the repeated block that makes up a card or list layout
@@ -2440,7 +2579,51 @@ const OBSERVABLE = new Set([
   'double_click', 'click_xy', 'submit', 'set_date', 'set_combobox', 'hover', 'scroll',
 ]);
 
+// Steps worth reproducing. Reads are excluded: replay repeats what changes the
+// page, and re-running perception adds time without affecting the outcome.
+const RECORDABLE = new Set([
+  'navigate', 'click', 'fill', 'press_key', 'select_option', 'submit', 'drag',
+  'set_date', 'set_combobox', 'double_click', 'triple_click', 'upload_file',
+  'drop_file', 'wait', 'wait_idle', 'dismiss_overlays', 'scroll',
+]);
+const recording = new Map(); // port → { name, steps: [] }
+
+async function recordStep(port, method, params, result) {
+  const rec = recording.get(port);
+  if (!rec || !RECORDABLE.has(method)) return;
+  const step = { method, params: { ...params } };
+  delete step.params.observe;
+  if (params?.selector) {
+    try {
+      const tab = await getSessionTab(port);
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, world: 'MAIN', func: bmcpPortableTarget, args: [params.selector],
+      });
+      if (r?.result) step.target = r.result;
+    } catch { /* selector may already be gone; the raw selector is kept as fallback */ }
+  }
+  if (result && typeof result === 'object') {
+    step.expect = {};
+    if (result.outcome) step.expect.outcome = result.outcome;
+    if (result.value_after !== undefined) step.expect.filled = true;
+    if (result.verified !== undefined) step.expect.verified = result.verified;
+    if (result.url_after) step.expect.url = result.url_after;
+    if (!Object.keys(step.expect).length) delete step.expect;
+  }
+  rec.steps.push(step);
+}
+
 async function dispatch(port, method, params) {
+  const rec = recording.get(port);
+  if (rec && RECORDABLE.has(method)) {
+    const result = await dispatchInner(port, method, params);
+    await recordStep(port, method, params, result).catch(() => {});
+    return result;
+  }
+  return dispatchInner(port, method, params);
+}
+
+async function dispatchInner(port, method, params) {
   if (!params || !params.observe || !OBSERVABLE.has(method)) {
     return dispatchCore(port, method, params);
   }
@@ -3429,7 +3612,7 @@ async function dispatchCore(port, method, params) {
         selector = f.result.ref;
       }
 
-      const clickRes = await dispatch(port, 'click', { selector });
+      const clickRes = await dispatchCore(port, 'click', { selector });
       if (clickRes && clickRes.ok === false) {
         return { ok: false, outcome: 'click_failed', click: clickRes, error: clickRes.error };
       }
@@ -3475,6 +3658,124 @@ async function dispatchCore(port, method, params) {
         hint: clickRes?.verified === false
           ? 'The click never reached the page (verified:false). The control may be covered by an overlay or in an iframe — try browser_dismiss_overlays, browser_list_frames, or browser_click_xy from a screenshot.'
           : 'The click landed but the page did not react within the timeout: the control may need a different trigger (press Enter in the field), the form may be blocked by hidden/invalid fields (check browser_form_state), or the request is slow (check browser_network_log).',
+      };
+    }
+
+    case 'record': {
+      const action = params.action || 'start';
+      const store = await chrome.storage.local.get({ bmcpFlows: {} });
+      const flows = store.bmcpFlows;
+
+      if (action === 'list') {
+        return {
+          flows: Object.entries(flows).map(([name, f]) => ({
+            name, steps: f.steps.length, start_url: f.start_url, saved: f.saved,
+            fields: f.steps.filter(s => s.method === 'fill').map(s => s.target?.name || s.params?.selector),
+          })),
+          recording: recording.has(port) ? recording.get(port).name : null,
+        };
+      }
+      if (action === 'show') {
+        const f = flows[params.name];
+        if (!f) return { ok: false, error: `No flow named ${params.name}` };
+        return { name: params.name, ...f };
+      }
+      if (action === 'delete') {
+        if (!flows[params.name]) return { ok: false, error: `No flow named ${params.name}` };
+        delete flows[params.name];
+        await chrome.storage.local.set({ bmcpFlows: flows });
+        return { ok: true, deleted: params.name };
+      }
+      if (action === 'start') {
+        if (!params.name) return { ok: false, error: 'name required' };
+        const tab = await getSessionTab(port).catch(() => null);
+        recording.set(port, { name: params.name, steps: [], start_url: tab?.url || null });
+        return { ok: true, recording: params.name, note: 'Actions that change the page are being recorded. Call again with action:"stop" to save.' };
+      }
+      if (action === 'stop') {
+        const rec = recording.get(port);
+        if (!rec) return { ok: false, error: 'Not recording' };
+        recording.delete(port);
+        if (!rec.steps.length) return { ok: false, error: 'Nothing was recorded — no page-changing actions ran.' };
+        flows[rec.name] = { steps: rec.steps, start_url: rec.start_url, saved: new Date().toISOString() };
+        await chrome.storage.local.set({ bmcpFlows: flows });
+        return {
+          ok: true, saved: rec.name, steps: rec.steps.length,
+          fields: rec.steps.filter(s => s.method === 'fill').map(s => s.target?.name || s.params?.selector).filter(Boolean),
+          note: 'Replay with browser_replay. Field values can be overridden per run by passing row keys that match the field names above.',
+        };
+      }
+      return { ok: false, error: `Unknown action: ${action}` };
+    }
+
+    case 'replay': {
+      const store = await chrome.storage.local.get({ bmcpFlows: {} });
+      const flow = store.bmcpFlows[params.name];
+      if (!flow) return { ok: false, error: `No flow named ${params.name}. List them with browser_record({action:"list"}).` };
+      const row = params.row || null;
+      const results = [];
+      let diverged = null;
+
+      if (params.start_url !== false && flow.start_url) {
+        await dispatchCore(port, 'navigate', { url: flow.start_url }).catch(() => {});
+      }
+
+      for (let i = 0; i < flow.steps.length; i++) {
+        const step = flow.steps[i];
+        const p = { ...step.params };
+
+        // Re-point the step at whatever now matches its recorded identity.
+        if (step.target) {
+          const tab = await getSessionTab(port);
+          const [r] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, world: 'MAIN', func: bmcpResolvePortable, args: [step.target],
+          }).catch(() => [null]);
+          const res = r?.result;
+          if (!res?.found) {
+            diverged = { step: i, method: step.method, reason: 'target-not-found', looked_for: step.target };
+            break;
+          }
+          p.selector = res.ref || res.css;
+          if (res.ambiguous) p._ambiguous = res.ambiguous;
+        }
+
+        // Per-run values: a row key matching the field's name wins over the recorded one.
+        if (step.method === 'fill' && row && step.target?.name) {
+          const key = Object.keys(row).find(k => k.toLowerCase() === String(step.target.name).toLowerCase());
+          if (key) p.value = String(row[key]);
+        }
+
+        let out;
+        try { out = await dispatchCore(port, step.method, p); }
+        catch (e) { out = { ok: false, error: e?.message || String(e) }; }
+        results.push({ step: i, method: step.method, ok: out?.ok !== false, value: p.value });
+
+        // Escalate on divergence rather than ploughing on into a wrong page.
+        const failed = out && typeof out === 'object' && (out.ok === false || out.found === false);
+        const wrongOutcome = step.expect?.outcome && out?.outcome && out.outcome !== step.expect.outcome;
+        if (failed || wrongOutcome) {
+          diverged = {
+            step: i, method: step.method,
+            reason: wrongOutcome ? 'different-outcome' : 'step-failed',
+            expected: step.expect || null,
+            actual: out,
+          };
+          break;
+        }
+      }
+
+      const tab = await getSessionTab(port).catch(() => null);
+      return {
+        ok: !diverged,
+        flow: params.name,
+        steps_run: results.length,
+        steps_total: flow.steps.length,
+        results: params.verbose ? results : undefined,
+        url: tab?.url,
+        ...(diverged ? {
+          diverged_at: diverged,
+          hint: 'The page no longer matches the recording at this step. Inspect with browser_form_state or browser_read_page, handle this case, then continue or re-record.',
+        } : {}),
       };
     }
 
@@ -4299,25 +4600,17 @@ async function dispatchCore(port, method, params) {
         return detection;
       }
 
-      // ── Auto-click reCAPTCHA checkbox ──
-      if (action === 'click_checkbox') {
-        const result = await clickRecaptchaCheckbox(tab.id);
-        // Wait for challenge or pass
-        await new Promise(r => setTimeout(r, 2500));
-        // Re-detect to see if it passed or image challenge appeared
-        const after = await detectCaptcha(tab.id);
-        return { ...result, after };
+      // Solving is deliberately not implemented: clicking through a CAPTCHA is a
+      // terms-of-service problem for the site owner and an unreliable capability.
+      // Detection is the honest part — it tells the caller to hand over to a human.
+      if (action === 'click_checkbox' || action === 'click_grid') {
+        return {
+          ok: false,
+          error: 'Solving CAPTCHAs is not supported. Tell the user a CAPTCHA is blocking the page and let them complete it in the browser, then continue.',
+          detected: await detectCaptcha(tab.id),
+        };
       }
 
-      // ── Click specific grid cells (AI vision guided) ──
-      if (action === 'click_grid') {
-        const cells = params.cells || [];
-        if (!cells.length) return { error: 'No cells specified' };
-        const result = await clickCaptchaGridCells(tab.id, cells);
-        return result;
-      }
-
-      // ── Human fallback ──
       if (action === 'ask_human') {
         return { method: 'human', instructions: 'Call browser_ask_user with message: "A CAPTCHA needs to be solved. Please solve it in the browser and click Done when finished."' };
       }
@@ -4391,6 +4684,21 @@ async function dispatchCore(port, method, params) {
             const key = 'ref_' + (++window.__bmcpRefSeq);
             try { Object.defineProperty(el, '__bmcpRef', { value: key, configurable: true }); } catch {}
             refs[key] = el;
+            // Fingerprint so the ref can be re-identified if the framework swaps the node.
+            try {
+              if (!window.__bmcpRefMeta) window.__bmcpRefMeta = {};
+              const nm = (e) => {
+                const a = e.getAttribute && e.getAttribute('aria-label');
+                if (a) return a.trim();
+                if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+                if (e.placeholder) return e.placeholder.trim();
+                const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+                return t ? t.slice(0, 80) : (e.name || e.id || '');
+              };
+              const myName = nm(el);
+              const peers = [...document.querySelectorAll(el.tagName)].filter(p => nm(p) === myName);
+              window.__bmcpRefMeta[key] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)) };
+            } catch {}
             return key;
           };
           const visible = (el) => {
@@ -4510,7 +4818,22 @@ async function dispatchCore(port, method, params) {
             if (el.__bmcpRef && refs[el.__bmcpRef] === el) return el.__bmcpRef;
             const k = 'ref_' + (++window.__bmcpRefSeq);
             try { Object.defineProperty(el, '__bmcpRef', { value: k, configurable: true }); } catch {}
-            refs[k] = el; return k;
+            refs[k] = el;
+            try {
+              if (!window.__bmcpRefMeta) window.__bmcpRefMeta = {};
+              const nm = (e) => {
+                const a = e.getAttribute && e.getAttribute('aria-label');
+                if (a) return a.trim();
+                if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+                if (e.placeholder) return e.placeholder.trim();
+                const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+                return t ? t.slice(0, 80) : (e.name || e.id || '');
+              };
+              const myName = nm(el);
+              const peers = [...document.querySelectorAll(el.tagName)].filter(p => nm(p) === myName);
+              window.__bmcpRefMeta[k] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)) };
+            } catch {}
+            return k;
           };
           const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
           const label = (el) => {
@@ -4608,6 +4931,21 @@ async function dispatchCore(port, method, params) {
             const key = 'ref_' + (++window.__bmcpRefSeq);
             try { Object.defineProperty(el, '__bmcpRef', { value: key, configurable: true }); } catch {}
             refs[key] = el;
+            // Fingerprint so the ref can be re-identified if the framework swaps the node.
+            try {
+              if (!window.__bmcpRefMeta) window.__bmcpRefMeta = {};
+              const nm = (e) => {
+                const a = e.getAttribute && e.getAttribute('aria-label');
+                if (a) return a.trim();
+                if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+                if (e.placeholder) return e.placeholder.trim();
+                const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+                return t ? t.slice(0, 80) : (e.name || e.id || '');
+              };
+              const myName = nm(el);
+              const peers = [...document.querySelectorAll(el.tagName)].filter(p => nm(p) === myName);
+              window.__bmcpRefMeta[key] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)) };
+            } catch {}
             return key;
           };
           const accName = (el) => {
@@ -4920,117 +5258,7 @@ async function detectCaptcha(tabId) {
   }
 }
 
-async function clickRecaptchaCheckbox(tabId) {
-  try {
-    await debuggerAttach(tabId);
-    // Find the reCAPTCHA anchor iframe position
-    const { result } = await cdpSend(tabId, 'Runtime.evaluate', {
-      expression: `(() => {
-        const iframe = document.querySelector('iframe[src*="recaptcha/api2/anchor"], iframe[src*="recaptcha/enterprise/anchor"]');
-        if (!iframe) return JSON.stringify({ found: false });
-        const rect = iframe.getBoundingClientRect();
-        // Checkbox is roughly at 27,30 inside the iframe (standard reCAPTCHA layout)
-        return JSON.stringify({ found: true, x: rect.x + 27, y: rect.y + 30 });
-      })()`,
-      returnByValue: true,
-    });
-    const pos = JSON.parse(result.value);
-    if (!pos.found) {
-      await debuggerDetach(tabId);
-      return { clicked: false, reason: 'reCAPTCHA checkbox iframe not found' };
-    }
 
-    // Click the checkbox using real mouse events
-    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-      type: 'mouseMoved', x: pos.x, y: pos.y,
-    });
-    await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
-    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-      type: 'mousePressed', x: pos.x, y: pos.y, button: 'left', clickCount: 1,
-    });
-    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-      type: 'mouseReleased', x: pos.x, y: pos.y, button: 'left', clickCount: 1,
-    });
-    await debuggerDetach(tabId);
-    return { clicked: true, position: pos, note: 'Checkbox clicked. Wait 2-3 seconds then re-detect to check if passed or image challenge appeared.' };
-  } catch (e) {
-    try { await debuggerDetach(tabId); } catch {}
-    return { clicked: false, error: e.message };
-  }
-}
-
-async function clickCaptchaGridCells(tabId, cells) {
-  try {
-    await debuggerAttach(tabId);
-    // Find the challenge iframe position and dimensions
-    const { result } = await cdpSend(tabId, 'Runtime.evaluate', {
-      expression: `(() => {
-        const iframe = document.querySelector('iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha/enterprise/bframe"]');
-        if (!iframe) return JSON.stringify({ found: false });
-        const rect = iframe.getBoundingClientRect();
-        return JSON.stringify({ found: true, x: rect.x, y: rect.y, width: rect.width, height: rect.height });
-      })()`,
-      returnByValue: true,
-    });
-    const frame = JSON.parse(result.value);
-    if (!frame.found) {
-      await debuggerDetach(tabId);
-      return { clicked: false, reason: 'Challenge iframe not found. Take a screenshot to verify CAPTCHA state.' };
-    }
-
-    // Determine grid size — reCAPTCHA uses 3x3 or 4x4 grids
-    // The image grid starts ~100px from top of iframe, and is roughly square
-    const gridTop = frame.y + 100;
-    const gridLeft = frame.x + 14;
-    const gridSize = frame.width - 28; // padding on each side
-    const cols = cells.some(c => c >= 9) ? 4 : 3;
-    const rows = cols;
-    const cellSize = gridSize / cols;
-
-    const maxCell = cols * rows - 1;
-    const validCells = cells.filter(c => c >= 0 && c <= maxCell);
-    if (!validCells.length) {
-      await debuggerDetach(tabId);
-      return { clicked: false, error: `All cell indices out of bounds. Grid is ${cols}x${rows}, valid range: 0-${maxCell}` };
-    }
-
-    const clicked = [];
-    for (const cell of validCells) {
-      const row = Math.floor(cell / cols);
-      const col = cell % cols;
-      const x = Math.round(gridLeft + col * cellSize + cellSize / 2);
-      const y = Math.round(gridTop + row * cellSize + cellSize / 2);
-
-      // Human-like click with small random offset
-      const ox = x + Math.round((Math.random() - 0.5) * cellSize * 0.3);
-      const oy = y + Math.round((Math.random() - 0.5) * cellSize * 0.3);
-
-      await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-        type: 'mouseMoved', x: ox, y: oy,
-      });
-      await new Promise(r => setTimeout(r, 150 + Math.random() * 300));
-      await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-        type: 'mousePressed', x: ox, y: oy, button: 'left', clickCount: 1,
-      });
-      await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-        type: 'mouseReleased', x: ox, y: oy, button: 'left', clickCount: 1,
-      });
-      await new Promise(r => setTimeout(r, 200 + Math.random() * 400));
-      clicked.push({ cell, row, col, x: ox, y: oy });
-    }
-
-    await debuggerDetach(tabId);
-    return {
-      clicked: true,
-      cells: clicked,
-      grid: `${cols}x${rows}`,
-      note: 'Cells clicked. Take a screenshot to verify, then click the "Verify" / "Skip" button if needed.',
-    };
-  } catch (e) {
-    try { await debuggerDetach(tabId); } catch {}
-    return { clicked: false, error: e.message };
-  }
-}
 
 // ── Start ───────────────────────────────────────────────────────────────────
 ensureOffscreen().catch(console.error);
