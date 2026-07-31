@@ -902,14 +902,19 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
   const readVal = (el) => el.isContentEditable ? (el.textContent || '') : (el.value != null ? el.value : '');
   const tagged = () => deepQ(document, '[' + TAG + ']');
 
-  // Snapshot every editable field so collateral damage is detectable/reversible.
-  const snapshotFields = () => {
+  // Snapshot editable fields so collateral damage is detectable and reversible.
+  // Scoped to the target's own form and capped: on a page with hundreds of fields
+  // walking all of them costs real time on every keystroke-level call, and stray
+  // text lands in a sibling field, not across the document.
+  const snapshotFields = (target) => {
+    const scope = (target && target.closest && target.closest('form, [role="form"], fieldset')) || document;
     const out = [];
-    for (const e of walkAll(document, [])) {
+    for (const e of scope.querySelectorAll('input, textarea, [contenteditable="true"]')) {
       const t = e.tagName;
       if (t !== 'INPUT' && t !== 'TEXTAREA' && !e.isContentEditable) continue;
       if (e.type === 'hidden' || e.type === 'password') continue;
       out.push({ el: e, v: String(readVal(e)) });
+      if (out.length >= 80) break;
     }
     return out;
   };
@@ -917,7 +922,7 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
   if (op === 'locate') {
     const el = resolve(selOrExpected);
     if (!el) return { found: false };
-    window.__bmcpFieldSnapshot = snapshotFields();
+    window.__bmcpFieldSnapshot = snapshotFields(el);
     try { el.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e) {}
     walkAll(document, []).forEach(n => { if (n.hasAttribute && n.hasAttribute(TAG)) n.removeAttribute(TAG); });
     el.setAttribute(TAG, '1');
@@ -3970,6 +3975,35 @@ async function dispatchCore(port, method, params) {
       }
 
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot print chrome:// pages');
+
+      // A tab showing a PDF is Chrome's viewer, not a document. Printing it
+      // re-renders or comes back blank, so fetch the file the viewer loaded.
+      const looksPdf = /\.pdf($|[?#])/i.test(tab.url) || await (async () => {
+        try {
+          const [r] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, world: 'MAIN',
+            func: () => !!document.querySelector('embed[type="application/pdf"], object[type="application/pdf"]') ||
+              document.contentType === 'application/pdf',
+          });
+          return r?.result === true;
+        } catch { return false; }
+      })();
+      if (looksPdf && params.mode !== 'print') {
+        try {
+          const res = await fetch(tab.url, { credentials: 'include' });
+          const bytes = new Uint8Array(await res.arrayBuffer());
+          let bin = '';
+          for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+          return {
+            ok: res.ok, status: res.status, content_type: res.headers.get('content-type') || 'application/pdf',
+            bytes: bytes.length, data: btoa(bin), source_url: tab.url,
+            note: 'This tab is displaying a PDF, so the original file was downloaded rather than the viewer being printed. Pass mode:"print" to print the viewer instead.',
+          };
+        } catch (e) {
+          return { ok: false, error: `The tab holds a PDF but it could not be downloaded: ${e?.message || e}` };
+        }
+      }
+
       try {
         await debuggerAttach(tab.id);
         await cdpSend(tab.id, 'Page.enable', {});
@@ -4235,6 +4269,31 @@ async function dispatchCore(port, method, params) {
 
       if (params.start_url !== false && flow.start_url) {
         await dispatchCore(port, 'navigate', { url: flow.start_url }).catch(() => {});
+        // Recorded URLs carry session tokens — retURL, jsessionid, sap-client — that
+        // go stale. The result is a login or expired-session page that reads as a
+        // perfectly ordinary page, so every step then fails for the wrong reason.
+        try {
+          const t = await getSessionTab(port);
+          const [chk] = await chrome.scripting.executeScript({
+            target: { tabId: t.id }, world: 'MAIN',
+            func: () => {
+              const text = (document.body?.innerText || '').slice(0, 3000).toLowerCase();
+              const pw = !!document.querySelector('input[type="password"]');
+              const signals = ['session has expired', 'session expired', 'please log in', 'please sign in',
+                'sign in to continue', 'your session', 'log in to continue', 'authentication required'];
+              const hit = signals.find(s => text.includes(s));
+              return { pw, hit: hit || null, url: location.href, title: document.title };
+            },
+          });
+          const c = chk?.result;
+          if (c && (c.hit || (c.pw && /login|signin|sign-in|auth/i.test(c.url)))) {
+            return {
+              ok: false, flow: params.name, steps_run: 0, steps_total: flow.steps.length,
+              diverged_at: { step: -1, reason: 'start-url-stale', landed_on: c.url, signal: c.hit || 'a password field on a login-looking URL' },
+              hint: 'The recorded starting URL led to a sign-in or expired-session page rather than the flow. Its session token has gone stale. Sign in, then replay with start_url:false from the right page, or re-record the flow.',
+            };
+          }
+        } catch { /* the check is advisory */ }
       }
 
       const SUBMITISH = /^(submit|save|continue|next|apply|pay|confirm|send|finish|create|book|place order|sign in|log in)\b/i;
@@ -4562,18 +4621,43 @@ async function dispatchCore(port, method, params) {
         (params.include_extension_requests || !(e.url || '').startsWith('chrome-extension://')) &&
         (!pat || (e.url || '').includes(pat)) &&
         (!params.only_failed || e.failed || (e.status >= 400)));
+      // Re-pull one response in full. A capped body is not valid JSON, so there has
+      // to be a way back to the whole thing rather than only a shorter copy.
+      if (params.request_id) {
+        const entry = buf.find(e => e.id === params.request_id);
+        if (!entry) return { ok: false, error: `No request ${params.request_id} in this tab's log.` };
+        try {
+          const r = await cdpSend(tab.id, 'Network.getResponseBody', { requestId: params.request_id });
+          if (!r || r.body == null) return { ok: false, error: 'Chrome no longer holds this response body; re-issue the request.' };
+          if (r.base64Encoded) return { ok: false, error: 'Response is binary; save it with browser_save mode:"url".' };
+          const full = String(r.body);
+          entry.body = full.length > NET_BODY_MAX ? full.slice(0, NET_BODY_MAX) : full;
+          return { ok: true, request_id: params.request_id, url: entry.url, bytes: full.length, body: full };
+        } catch (e) {
+          return { ok: false, error: `Could not re-read the body: ${e?.message || e}. Chrome evicts response bodies after a while; re-issue the request.` };
+        }
+      }
+
       const total = out.length;
       const bodyChars = Math.min(200000, params.max_body_chars || 4000);
-      out = out.slice(-(params.limit || 50)).map(({ id, started, body, ...rest }) => {
+      out = out.slice(-(params.limit || 50)).map(({ started, body, ...rest }) => {
         // Bodies are captured always but returned only when asked for, so the
         // default listing stays small.
         if (!params.include_body) {
           return body ? { ...rest, has_body: true, body_bytes: body.length } : rest;
         }
         if (!body) return rest;
+        // Say plainly when the payload is not the whole thing: a cut JSON body will
+        // not parse, and silently handing one back invites the caller to try.
+        const cut = body.length > bodyChars;
         return {
           ...rest,
-          body: body.length > bodyChars ? body.slice(0, bodyChars) + `\n[truncated, ${body.length} chars total]` : body,
+          body: cut ? body.slice(0, bodyChars) : body,
+          ...(cut || rest.body_truncated ? {
+            truncated: true,
+            complete_bytes: rest.body_truncated || body.length,
+            note: `Body is cut and will not parse as JSON. Re-read the whole response with browser_network_log({request_id:"${rest.id}"}).`,
+          } : {}),
         };
       });
       if (params.clear) networkLogs.set(tab.id, []);
