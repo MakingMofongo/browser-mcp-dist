@@ -168,6 +168,9 @@ async function addTabToSession(port, tabId) {
 }
 
 async function releaseSession(port) {
+  // Dropped with the session that produced it, so a long-lived worker does not
+  // accumulate the history of every session that has ever connected.
+  callLogs.delete(port);
   const session = sessions.get(port);
   if (!session) return;
 
@@ -3131,11 +3134,16 @@ chrome.webNavigation?.onCommitted?.addListener((d) => {
 // to a fallback path silently by design — none of which is visible from a single
 // result. Kept small and bounded, and holds no page content: a method name, how
 // long it took, whether it worked, and which path it took.
-const callLog = [];
+// Per session, not shared. More than one Claude session drives this extension at
+// a time, and a history mixing them together would attribute one session's slow
+// clicks to another's run — and show its activity to someone who is not doing it.
+const callLogs = new Map(); // port → recent calls
 const CALL_LOG_MAX = 250;
 
-function noteCall(method, ms, result) {
+function noteCall(port, method, ms, result) {
   const r = result && typeof result === 'object' ? result : {};
+  let callLog = callLogs.get(port);
+  if (!callLog) { callLog = []; callLogs.set(port, callLog); }
   callLog.push({
     method, ms,
     ok: r.ok !== false && r.found !== false,
@@ -3157,7 +3165,7 @@ async function dispatch(port, method, params) {
   } else {
     result = await dispatchInner(port, method, params);
   }
-  noteCall(method, Date.now() - started, result);
+  noteCall(port, method, Date.now() - started, result);
   await trackWrite(port, method, params, result);
   return result;
 }
@@ -3165,8 +3173,9 @@ async function dispatch(port, method, params) {
 // Summarised rather than dumped: 250 rows of history in every health call would
 // cost more attention than it repays. What matters is which calls are slow, which
 // are failing, and which are quietly running on a fallback.
-function callLogSummary() {
-  if (!callLog.length) return null;
+function callLogSummary(port) {
+  const callLog = callLogs.get(port);
+  if (!callLog || !callLog.length) return null;
   const by = new Map();
   for (const c of callLog) {
     let e = by.get(c.method);
@@ -6993,6 +7002,7 @@ async function dispatchCore(port, method, params) {
       // The two reasons a page stops responding that are not faults at all: it is
       // asking for a person. Reported here so the answer arrives with the
       // diagnosis, rather than needing a separate call to go looking for it.
+      const recentCalls = callLogSummary(port);
       // Both checks inject rather than attaching the debugger: a diagnostic that
       // changes the state it is reporting on is worse than no diagnostic.
       let captcha = null, wall = null;
@@ -7020,7 +7030,7 @@ async function dispatchCore(port, method, params) {
           : 'available or not yet tested',
         ...(captcha ? { captcha } : {}),
         ...(wall ? { auth_wall: { detected: wall.evidence, url: wall.url } } : {}),
-        ...(callLogSummary() ? { recent: callLogSummary() } : {}),
+        ...(recentCalls ? { recent: recentCalls } : {}),
         hint: captcha ? 'A CAPTCHA is on the page. It cannot be solved from here, and it is there precisely to require a person — tell the user what is blocking the flow, let them clear it in the browser, then continue.' :
               wall ? `The page is asking for authentication (${wall.evidence}). Tell the user, let them sign in, then continue. Automation cannot get past this on its own.` :
               !scriptingOk ? (!tab.url || tab.url.startsWith('about:') || tab.url.startsWith('chrome://')
