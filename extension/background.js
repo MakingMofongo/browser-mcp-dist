@@ -2256,6 +2256,129 @@ async function dropFileOnTarget(tabId, selector, files) {
 
 // ── Command Dispatcher ──────────────────────────────────────────────────────
 
+// ── Structured extraction ──────────────────────────────────────────────────
+// Injected whole (chrome.scripting does not serialise closures). Prefers a real
+// <table>; otherwise infers the repeated block that makes up a card or list layout
+// and lines those items up into columns so the result is still tabular.
+function bmcpExtractOp(selector, mode, budget) {
+  const deepQ = (root, s) => {
+    let el = null;
+    try { el = root.querySelector(s); } catch (e) { return null; }
+    if (el) return el;
+    for (const n of root.querySelectorAll('*')) if (n.shadowRoot) { const f = deepQ(n.shadowRoot, s); if (f) return f; }
+    return null;
+  };
+  const txt = (el) => (el ? (el.innerText || el.textContent || '') : '').replace(/\s+/g, ' ').trim();
+  const vis = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const st = getComputedStyle(el);
+    return st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  const root = selector ? deepQ(document, selector) : document.body;
+  if (!root) return { error: 'Container not found: ' + selector };
+
+  // ── real tables ──
+  if (mode !== 'list') {
+    const tables = (root.tagName === 'TABLE' ? [root] : [...root.querySelectorAll('table')])
+      .filter(t => vis(t) && t.rows.length > 1)
+      .sort((a, b) => (b.rows.length * (b.rows[0]?.cells.length || 1)) - (a.rows.length * (a.rows[0]?.cells.length || 1)));
+    if (tables.length) {
+      const t = tables[0];
+      let headers = [...t.querySelectorAll('thead th')].map(txt).filter(Boolean);
+      let bodyRows = [...(t.tBodies[0]?.rows || t.rows)];
+      if (!headers.length) {
+        const first = t.rows[0];
+        const allTh = first && [...first.cells].every(c => c.tagName === 'TH');
+        if (allTh) { headers = [...first.cells].map(txt); bodyRows = [...t.rows].slice(1); }
+      } else if (t.tHead && bodyRows.length && t.tHead.contains(bodyRows[0])) {
+        bodyRows = [...t.rows].slice(t.tHead.rows.length);
+      }
+      const width = Math.max(headers.length, ...bodyRows.slice(0, 5).map(r => r.cells.length));
+      if (!headers.length) headers = Array.from({ length: width }, (_, i) => `col${i + 1}`);
+      const rows = [];
+      for (const tr of bodyRows) {
+        if (rows.length >= budget) break;
+        if (!tr.cells.length) continue;
+        const o = {};
+        [...tr.cells].forEach((c, i) => {
+          const key = headers[i] || `col${i + 1}`;
+          const link = c.querySelector('a[href]');
+          o[key] = txt(c);
+          if (link && link.href) o[key + '_href'] = link.href;
+        });
+        rows.push(o);
+      }
+      return { source: 'table', columns: headers, rows };
+    }
+  }
+
+  // ── repeated structures (cards, list items, result rows) ──
+  const sig = (el) => {
+    const cls = typeof el.className === 'string'
+      ? el.className.trim().split(/\s+/).filter(c => c && !/\d{3,}|^(is|has)-|active|selected|hover/.test(c)).slice(0, 3).sort().join('.')
+      : '';
+    return el.tagName + (cls ? '.' + cls : '');
+  };
+  let best = null;
+  const parents = [root, ...root.querySelectorAll('*')];
+  for (const parent of parents) {
+    const kids = [...parent.children].filter(vis);
+    if (kids.length < 3) continue;
+    const groups = new Map();
+    for (const k of kids) {
+      const s = sig(k);
+      if (!groups.has(s)) groups.set(s, []);
+      groups.get(s).push(k);
+    }
+    for (const [s, members] of groups) {
+      if (members.length < 3) continue;
+      const avgLen = members.reduce((a, m) => a + txt(m).length, 0) / members.length;
+      if (avgLen < 12) continue;
+      const score = members.length * Math.min(avgLen, 400);
+      if (!best || score > best.score) best = { score, members, sig: s };
+    }
+  }
+  if (!best) return { error: 'No table or repeated structure found. Pass a selector for the container, or use browser_get_page_content.' };
+
+  // Columns = child signatures present in most items, so cards line up like rows.
+  const counts = new Map();
+  for (const m of best.members) {
+    const seen = new Set();
+    for (const c of m.querySelectorAll('*')) {
+      if (!txt(c) || c.children.length > 2) continue;
+      const s = sig(c);
+      if (seen.has(s)) continue;
+      seen.add(s);
+      counts.set(s, (counts.get(s) || 0) + 1);
+    }
+  }
+  const threshold = best.members.length * 0.6;
+  const colSigs = [...counts.entries()].filter(([, n]) => n >= threshold).map(([s]) => s).slice(0, 8);
+  const nameFor = (s, i) => {
+    const cls = s.split('.').slice(1).join('_');
+    return (cls || s.toLowerCase()).replace(/[^a-z0-9_]/gi, '_').slice(0, 24) || `field${i + 1}`;
+  };
+  const columns = colSigs.length ? colSigs.map(nameFor) : ['text'];
+  const rows = [];
+  for (const m of best.members) {
+    if (rows.length >= budget) break;
+    const o = {};
+    if (colSigs.length) {
+      colSigs.forEach((s, i) => {
+        const hit = [...m.querySelectorAll('*')].find(c => sig(c) === s && txt(c));
+        o[nameFor(s, i)] = hit ? txt(hit).slice(0, 300) : '';
+      });
+    } else {
+      o.text = txt(m).slice(0, 300);
+    }
+    const a = m.querySelector('a[href]') || (m.tagName === 'A' ? m : null);
+    if (a && a.href) o.href = a.href;
+    if (Object.values(o).some(v => v)) rows.push(o);
+  }
+  return { source: 'repeated-structure:' + best.sig, columns: [...columns, ...(rows.some(r => r.href) ? ['href'] : [])], rows };
+}
+
 // ── Post-action observation ────────────────────────────────────────────────
 // An image after every interaction is the obvious way to answer "what happened?",
 // and the wrong one: it costs ~1500 tokens a call and most of the frame is
@@ -3352,6 +3475,99 @@ async function dispatchCore(port, method, params) {
         hint: clickRes?.verified === false
           ? 'The click never reached the page (verified:false). The control may be covered by an overlay or in an iframe — try browser_dismiss_overlays, browser_list_frames, or browser_click_xy from a screenshot.'
           : 'The click landed but the page did not react within the timeout: the control may need a different trigger (press Enter in the field), the form may be blocked by hidden/invalid fields (check browser_form_state), or the request is slow (check browser_network_log).',
+      };
+    }
+
+    case 'extract': {
+      // Structured data without hand-written DOM code. Handles real tables and, for
+      // card/list layouts, infers the repeated structure and lines the items up into
+      // columns. Optionally follows pagination and merges the pages.
+      const tab = await getSessionTab(port);
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot read chrome:// pages');
+      const maxRows = Math.min(2000, params.max_rows || 200);
+      const maxPages = params.paginate ? Math.min(50, params.max_pages || 10) : 1;
+
+      const rows = [];
+      let columns = null, source = null, pagesRead = 0, stoppedBecause = 'single-page', scopeNote = null;
+
+      for (let page = 0; page < maxPages; page++) {
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: 'MAIN',
+          args: [params.selector || null, params.mode || 'auto', maxRows - rows.length],
+          func: bmcpExtractOp,
+        });
+        let r = res?.result;
+        // A scoped search that finds nothing is usually a mis-aimed selector — the
+        // page often has several elements with that class. Retry across the whole
+        // page and say that is what happened, rather than dead-ending.
+        if (page === 0 && params.selector && (!r || r.error)) {
+          const [wide] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, world: 'MAIN',
+            args: [null, params.mode || 'auto', maxRows],
+            func: bmcpExtractOp,
+          });
+          if (wide?.result && !wide.result.error) {
+            r = wide.result;
+            r.note = `Nothing extractable inside ${params.selector}; extracted from the whole page instead.`;
+          }
+        }
+        if (!r || r.error) {
+          if (page === 0) return { ok: false, error: r?.error || 'Nothing extractable found on this page.' };
+          stoppedBecause = 'no-data-on-page';
+          break;
+        }
+        if (r.note) scopeNote = r.note;
+        pagesRead++;
+        source = source || r.source;
+        if (!columns) columns = r.columns;
+        for (const row of r.rows) {
+          if (rows.length >= maxRows) break;
+          rows.push(row);
+        }
+        if (rows.length >= maxRows) { stoppedBecause = 'max_rows reached'; break; }
+        if (page + 1 >= maxPages) { stoppedBecause = maxPages > 1 ? 'max_pages reached' : 'single-page'; break; }
+
+        // Advance pagination
+        const [nav] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: 'MAIN',
+          args: [params.next_selector || null],
+          func: (nextSel) => {
+            const vis = (el) => { const b = el.getBoundingClientRect(); return b.width > 0 && b.height > 0; };
+            const disabled = (el) => el.disabled || el.getAttribute('aria-disabled') === 'true' ||
+              /(^|\s)(disabled)(\s|$)/.test(typeof el.className === 'string' ? el.className : '');
+            let el = null;
+            if (nextSel) { try { el = document.querySelector(nextSel); } catch (e) {} }
+            if (!el) {
+              // Real next controls rarely read exactly "next": they carry an arrow
+              // ("Next →"), sit inside li.next, or only expose intent via rel/aria.
+              const cands = [...document.querySelectorAll('a[rel="next"], [aria-label*="next" i], li.next > a, .pagination a, .pager a, nav a, button, a')].filter(vis);
+              const isNext = (e) => {
+                if (e.getAttribute('rel') === 'next') return true;
+                if (/next/i.test(e.getAttribute('aria-label') || '')) return true;
+                if (e.closest('li.next, .next, [class*="next" i]')) return true;
+                const t = (e.textContent || '').trim();
+                return /^next\b/i.test(t) || /^(›|»|→|>|>>)$/.test(t);
+              };
+              el = cands.find(isNext);
+            }
+            if (!el) return { done: true, why: 'no next control found' };
+            if (disabled(el)) return { done: true, why: 'next control is disabled' };
+            el.scrollIntoView({ block: 'center', behavior: 'instant' });
+            el.click();
+            return { done: false };
+          },
+        }).catch(() => [null]);
+        if (!nav?.result || nav.result.done) { stoppedBecause = nav?.result?.why || 'pagination ended'; break; }
+        await dispatchCore(port, 'wait_idle', { timeout: 8000, quiet_ms: 400 }).catch(() => {});
+      }
+
+      return {
+        ok: true, source, columns, rows,
+        row_count: rows.length,
+        pages_read: pagesRead,
+        stopped_because: stoppedBecause,
+        ...(scopeNote ? { note: scopeNote } : {}),
+        url: tab.url,
       };
     }
 
