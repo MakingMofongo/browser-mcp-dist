@@ -3146,6 +3146,54 @@ const RECORDABLE = new Set([
 ]);
 const recording = new Map(); // port → { name, steps: [] }
 
+// What a step did, with the particulars taken out. A clean run is the only
+// reference for normal that does not have to be written down as a rule: a
+// postcode filling in a city, an autosave firing on blur, a confirm-email box
+// mirroring its neighbour are all observed once and are then simply expected —
+// no classification, no heuristic, nothing to maintain. What matters is that this
+// records the shape and never the values, or every row would look like a
+// divergence from the row before it.
+function requestShape(sent) {
+  return (sent || []).map((s) => {
+    const [method, url] = String(s).split(' ');
+    let path = url || '';
+    try { path = new URL(url).pathname; } catch { path = (url || '').split('?')[0]; }
+    // Row identifiers are exactly what differs between rows and never what
+    // matters about the request.
+    path = path
+      .replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '/{id}')
+      .replace(/\/\d+/g, '/{id}');
+    return `${method} ${path}`;
+  }).filter(Boolean);
+}
+
+function stepShape(result) {
+  const shape = {};
+  const sent = requestShape(result.sent);
+  if (sent.length) shape.sent = [...new Set(sent)].sort();
+  // The field names a write also reached. Names only — a mirrored value differs
+  // per row, the fact that the mirror exists does not.
+  const touched = [...(result.also_received_this_value || []), ...(result.also_changed || []).map(s => String(s).split(' →')[0])];
+  if (touched.length) shape.touched = [...new Set(touched.map(s => String(s).trim()))].sort();
+  return Object.keys(shape).length ? shape : null;
+}
+
+// Compares what just happened against what the clean run did. Only things that
+// are new count: a request that did not fire when this was recorded, a field that
+// was not touched then. Something absent this time is not reported here, because
+// a page legitimately skips work for a row that does not need it.
+function shapeDivergence(recorded, actual) {
+  if (!recorded) return null;
+  const now = actual || {};
+  const newSent = (now.sent || []).filter(s => !(recorded.sent || []).includes(s));
+  const newTouched = (now.touched || []).filter(t => !(recorded.touched || []).includes(t));
+  if (!newSent.length && !newTouched.length) return null;
+  return {
+    ...(newSent.length ? { unexpected_requests: newSent } : {}),
+    ...(newTouched.length ? { unexpected_fields: newTouched } : {}),
+  };
+}
+
 async function recordStep(port, method, params, result) {
   const rec = recording.get(port);
   if (!rec || !RECORDABLE.has(method)) return;
@@ -3167,6 +3215,8 @@ async function recordStep(port, method, params, result) {
     if (result.verified !== undefined) step.expect.verified = result.verified;
     if (result.url_after) step.expect.url = result.url_after;
     if (!Object.keys(step.expect).length) delete step.expect;
+    const shape = stepShape(result);
+    if (shape) step.shape = shape;
   }
   rec.steps.push(step);
 }
@@ -3261,13 +3311,7 @@ async function dispatch(port, method, params) {
     if (tabId) mark = await requestMark(tabId);
   }
 
-  let result;
-  if (rec && RECORDABLE.has(method)) {
-    result = await dispatchInner(port, method, params);
-    await recordStep(port, method, params, result).catch(() => {});
-  } else {
-    result = await dispatchInner(port, method, params);
-  }
+  const result = await dispatchInner(port, method, params);
 
   // Reported, not judged. A page that autosaves, searches as you type or posts
   // analytics fires these constantly, so treating any of them as a fault would
@@ -3284,6 +3328,11 @@ async function dispatch(port, method, params) {
       if (mutating.length > 6) result.sent_more = mutating.length - 6;
     }
   }
+
+  // Recorded after the requests have been attached, not before. Taking the step
+  // down first captured everything except the part the comparison needs, so a
+  // recorded flow could never know which requests were normal for it.
+  if (rec && RECORDABLE.has(method)) await recordStep(port, method, params, result).catch(() => {});
 
   noteCall(port, method, Date.now() - started, result);
   await trackWrite(port, method, params, result);
@@ -5048,6 +5097,11 @@ async function dispatchCore(port, method, params) {
         const classify = (d) => {
           if (!d) return null;
           if (d.reason === 'auth-wall') return 'auth';
+          // The step worked, and did something the clean run never did. Treated as
+          // structural because the rest of the queue would do the same thing, and
+          // because an unexplained request is the one case worth stopping a whole
+          // run over rather than carrying on and finding out later.
+          if (d.reason === 'unexpected-effect') return 'structural';
           if (d.reason === 'target-not-found') return 'structural';
           const a = d.actual || {};
           const blob = JSON.stringify(a);
@@ -5382,8 +5436,21 @@ async function dispatchCore(port, method, params) {
         }
 
         let out;
+        // Replayed steps go through dispatchCore, which skips the request capture
+        // that dispatch does — so without this the comparison would have nothing
+        // to compare and would quietly never fire.
+        let stepMark = null, stepTab = null;
+        if (COMMITTING.has(step.method)) {
+          try { stepTab = (await getSessionTab(port)).id; stepMark = await requestMark(stepTab); } catch {}
+        }
         try { out = await dispatchCore(port, step.method, p); }
         catch (e) { out = { ok: false, error: e?.message || String(e) }; }
+        if (stepMark != null && out && typeof out === 'object') {
+          await new Promise(r => setTimeout(r, 250));
+          const fired = await requestsSince(stepTab, stepMark);
+          const mutating = (fired || []).filter(q => MUTATING_VERB.test(q.method));
+          if (mutating.length) out.sent = mutating.slice(0, 6).map(q => `${q.method} ${q.url}` + (q.status ? ` → ${q.status}` : ''));
+        }
         results.push({ step: i, method: step.method, ok: out?.ok !== false, value: p.value });
 
         // Escalate on divergence rather than ploughing on into a wrong page.
@@ -5402,6 +5469,23 @@ async function dispatchCore(port, method, params) {
             actual: out,
           };
           break;
+        }
+
+        // Nothing failed, but this step did something the clean run did not — a
+        // request that never fired when it was recorded, or a field it never
+        // touched. That is the shape of a click landing on the wrong row: every
+        // check passes because the fields are fine, and only the comparison with
+        // what normally happens shows it. Not applied to a dry run, where the
+        // requests are deliberately blocked and so never match.
+        if (!diverged && !dryRun && step.shape) {
+          const drift = shapeDivergence(step.shape, stepShape(out || {}));
+          if (drift) {
+            diverged = {
+              step: i, method: step.method, reason: 'unexpected-effect', ...drift,
+              recorded: step.shape.sent || [],
+            };
+            break;
+          }
         }
       }
 
