@@ -3397,8 +3397,18 @@ async function dispatchCore(port, method, params) {
       // Ending on about:blank when a real address was asked for means the load
       // was abandoned — reporting that as success sends the caller off to read
       // an empty document.
-      const blanked = landedOn === 'about:blank' && !/^about:blank/i.test(String(params.url || ''));
-      const failed = navError || blanked || (landedOn && landedOn.startsWith('chrome-error://'));
+      // What the document says it is beats what the event said, because the event
+      // is not always about the navigation that mattered. ERR_ABORTED in
+      // particular fires for a navigation that was superseded or redirected —
+      // routine, and frequently followed by the page loading perfectly well.
+      const where = landedOn || updated.url || '';
+      const onErrorPage = where.startsWith('chrome-error://');
+      const blanked = /^about:blank/.test(where) && !/^about:blank/i.test(String(params.url || ''));
+      // ERR_ABORTED is the one to disregard when a document did arrive; every
+      // other reported error means the load genuinely did not happen, and the
+      // document cannot be consulted about it because Chrome's error page refuses
+      // injection — which is why the requested URL is still sitting on the tab.
+      const failed = onErrorPage || blanked || (navError && navError !== 'net::ERR_ABORTED');
       if (failed) {
         const why = {
           'net::ERR_NAME_NOT_RESOLVED': 'the host name does not resolve',
@@ -3419,6 +3429,34 @@ async function dispatchCore(port, method, params) {
       }
 
       const result = { ok: true, title: updated.title, url: landedOn || updated.url, tab_id: tab.id, session: session.label };
+
+      // A server error page loads perfectly well — Chrome reports success because
+      // it did receive a document, and it is only the wrong one. Left unsaid, a
+      // run carries on against "503 Service Temporarily Unavailable" as though it
+      // were the page it asked for. Reading the status out of what the server
+      // rendered needs no extra permission, and server error pages say it plainly
+      // in the title or the first heading. Not treated as a failure, because
+      // fetching a 404 on purpose is a legitimate thing to do — but never silent.
+      try {
+        const [srv] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => {
+            const title = (document.title || '').trim();
+            const h1 = (document.querySelector('h1')?.textContent || '').trim();
+            const m = /^\s*(4\d\d|5\d\d)\b[\s\-–—:]*(.{0,60})/.exec(title) || /^\s*(4\d\d|5\d\d)\b[\s\-–—:]*(.{0,60})/.exec(h1);
+            if (!m) return null;
+            // A page merely mentioning a number is not an error page; these say it
+            // first and say little else.
+            const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+            if (body.length > 1200) return null;
+            return { status: Number(m[1]), said: (m[0] || '').trim().slice(0, 80) };
+          },
+        });
+        if (srv?.result) {
+          result.http_status = srv.result.status;
+          result.note = `The page loaded, but the server answered with ${srv.result.status} — it is showing "${srv.result.said}" rather than the content that was asked for.`;
+        }
+      } catch { /* advisory only */ }
       // A redirect somewhere other than where the caller asked is worth saying
       // plainly — most often it is a sign-in wall standing in front of the page.
       if (landedOn && landedOn !== params.url) {
