@@ -4144,6 +4144,15 @@ async function dispatchCore(port, method, params) {
         let stopped = null;
         for (const entry of ledger.rows) {
           if (entry.status === 'done' || entry.status === 'skipped') continue;
+          // A row that failed after something was posted may already exist on the
+          // other side. Re-running it blind is how a resume creates duplicates, so
+          // it is held for review unless the caller says to retry it anyway.
+          if (entry.possibly_committed && !params.retry_committed) {
+            entry.status = 'needs_review';
+            entry.note = 'held back: a request was sent before this row failed, so it may already have been recorded. Confirm on the site, then mark it done or re-run with retry_committed:true.';
+            await persist();
+            continue;
+          }
           const postsBefore = postsSeen();
           let r = await dispatchCore(port, 'replay', { ...params, rows: undefined, resume: undefined, row: entry.row, verbose: false });
           let kind = r.ok ? null : classify(r.diverged_at);
@@ -4182,7 +4191,11 @@ async function dispatchCore(port, method, params) {
             // Whether anything was committed decides rerun versus duplicate.
             const steps = r.steps_total || 0;
             entry.progress = `${r.steps_run || 0}/${steps}`;
-            entry.possibly_committed = postsSeen() > postsBefore;
+            // Only uncertainty counts. A row the page rejected did send a request,
+            // but the server answered no — flagging that as possibly committed would
+            // hold back rows that plainly need re-running, and cry wolf on the flag
+            // that exists to prevent duplicates.
+            entry.possibly_committed = kind !== 'row-level' && postsSeen() > postsBefore;
           }
           await persist();
 
@@ -4224,9 +4237,25 @@ async function dispatchCore(port, method, params) {
         await dispatchCore(port, 'navigate', { url: flow.start_url }).catch(() => {});
       }
 
+      const SUBMITISH = /^(submit|save|continue|next|apply|pay|confirm|send|finish|create|book|place order|sign in|log in)\b/i;
+      const dryRun = params.dry_run === true;
+
       for (let i = 0; i < flow.steps.length; i++) {
         const step = flow.steps[i];
         const p = { ...step.params };
+
+        // A dry run drives the form but commits nothing, so a batch can be checked
+        // against real validation before anything is submitted for the first time.
+        // Recorded clicks that look like a submit are held back too, since a click
+        // is what commits on forms that were not recorded via browser_submit.
+        if (dryRun) {
+          const looksCommitting = step.method === 'submit' ||
+            (step.method === 'click' && SUBMITISH.test(String(step.target?.name || '')));
+          if (looksCommitting) {
+            results.push({ step: i, method: step.method, ok: true, held: 'not submitted (dry run)' });
+            continue;
+          }
+        }
 
         // Re-point the step at whatever now matches its recorded identity.
         if (step.target) {
@@ -4275,9 +4304,30 @@ async function dispatchCore(port, method, params) {
       }
 
       const tab = await getSessionTab(port).catch(() => null);
+
+      // With nothing submitted, the useful answer is whether it WOULD have been
+      // accepted — so read the validation state the form is now showing.
+      let validation;
+      if (dryRun && !diverged && tab) {
+        try {
+          const fs = await dispatchCore(port, 'form_state', {});
+          const missing = (fs.fields || []).filter(f => f.MISSING_REQUIRED).map(f => f.label);
+          const invalid = (fs.fields || []).filter(f => f.invalid)
+            .map(f => `${f.label}: ${f.validation_message || f.error_text || 'invalid'}`);
+          validation = {
+            would_submit: missing.length === 0 && invalid.length === 0 && !(fs.page_errors || []).length,
+            missing_required: missing.length ? missing : undefined,
+            invalid_fields: invalid.length ? invalid : undefined,
+            page_errors: (fs.page_errors || []).length ? fs.page_errors : undefined,
+          };
+        } catch { /* validation is advisory */ }
+      }
+
       return {
-        ok: !diverged,
+        ok: !diverged && (!validation || validation.would_submit !== false),
         flow: params.name,
+        ...(dryRun ? { dry_run: true, committed: false } : {}),
+        ...(validation ? { validation } : {}),
         steps_run: results.length,
         steps_total: flow.steps.length,
         results: params.verbose ? results : undefined,
