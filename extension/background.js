@@ -304,21 +304,32 @@ const INPUT_METHODS = new Set([
 // Verify Chrome's actual debugger-truth before trusting local cache.
 // Fixes "ghost-attached" state where Set says attached but Chrome side is gone
 // (happens on SW lifecycle events, user-canceled banners, anti-automation evictions).
-async function verifyAttachedWithChrome(tabId) {
-  try {
-    const targets = await chrome.debugger.getTargets();
-    const t = targets.find(x => x.tabId === tabId);
-    return !!t?.attached;
-  } catch {
-    return false; // assume not-attached on API error
+// chrome.debugger.getTargets() does not necessarily show the new session the
+// instant attach() resolves. Reading it once and treating "not there yet" as a
+// failed attach means detaching a session that was fine, retrying through the
+// whole backoff, and ending up on the synthetic path anyway — about five seconds
+// spent per input action to throw away the attach that had already worked. A few
+// short re-reads settle it.
+async function verifyAttachedWithChrome(tabId, attempts = 4) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const targets = await chrome.debugger.getTargets();
+      if (targets.find(x => x.tabId === tabId)?.attached) return true;
+    } catch {
+      return false; // assume not-attached on API error
+    }
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, 40));
   }
+  return false;
 }
 
 async function debuggerAttach(tabId) {
   // First check local cache — fast path
   if (debuggerAttached.has(tabId)) {
     // Verify with Chrome before trusting cache (cheap, ~1ms)
-    if (await verifyAttachedWithChrome(tabId)) return;
+    // Single read here: this path is asking whether a session we already believe
+    // in is still alive, so a stale answer costs one re-attach, not five seconds.
+    if (await verifyAttachedWithChrome(tabId, 1)) return;
     // Cache was stale — Chrome doesn't actually have us attached
     debuggerAttached.delete(tabId);
   }
@@ -506,7 +517,53 @@ const RETRYABLE_CDP_METHODS = new Set([
 // CDP wrapper with auto-recovery: re-attaches on detach errors.
 // For read-only methods (whitelist above), retries once after re-attach.
 // For side-effectful methods, only re-attaches and throws — caller must decide.
+// Some CDP input commands are acknowledged by the compositor rather than the
+// renderer — a wheel event, a mouse move with a button held. A window that is not
+// in front produces no frames, so those commands never settle and the caller waits
+// for ever. That single rule was behind scroll hanging on every page, drag never
+// returning, and keys and combobox typing going nowhere. Rather than remember it at
+// each call site, every input command gets a deadline here, so the worst outcome a
+// future one can produce is a clear failure instead of a hang.
+// Deliberately generous. Tools that can fall back to another path set their own,
+// tighter deadline; this one exists only so that nothing can wait for ever, and a
+// value tight enough to second-guess a merely slow command would break working
+// input to buy nothing.
+const INPUT_DEADLINE_MS = 15000;
+
+// When the Chrome window is not in front, a mouse press is not refused — it waits
+// on a compositor that is not running and gives up after about five seconds. The
+// synthetic path then does the work anyway, so every click cost five seconds to
+// reach a fallback that was always going to be used. Once that has been seen on a
+// window there is no sense paying it again on the next click, so it is remembered
+// briefly and rechecked afterwards, since the user may have brought Chrome forward.
+const trustedInputFailedAt = new Map(); // windowId → timestamp
+const TRUSTED_RECHECK_MS = 45000;
+const TRUSTED_PROBE_MS = 900;
+
+function trustedInputLikelyDead(windowId) {
+  const t = trustedInputFailedAt.get(windowId ?? -1);
+  return !!t && (Date.now() - t) < TRUSTED_RECHECK_MS;
+}
+function noteTrustedInputFailed(windowId) {
+  trustedInputFailedAt.set(windowId ?? -1, Date.now());
+}
+function noteTrustedInputWorked(windowId) {
+  trustedInputFailedAt.delete(windowId ?? -1);
+}
+
 async function cdpSend(tabId, method, params = {}) {
+  if (method.startsWith('Input.')) {
+    return Promise.race([
+      cdpSendInner(tabId, method, params),
+      new Promise((_, rej) => setTimeout(
+        () => rej(new Error(`Chrome did not acknowledge ${method} within ${INPUT_DEADLINE_MS}ms. This is what happens when the Chrome window is not in front — input of this kind is answered by the compositor, which is not running for a background window. Use a path that does not need real input, or bring the window forward.`)),
+        INPUT_DEADLINE_MS)),
+    ]);
+  }
+  return cdpSendInner(tabId, method, params);
+}
+
+async function cdpSendInner(tabId, method, params = {}) {
   await debuggerAttach(tabId);
   let lastMsg = '';
   // 4 total attempts (initial + 3 retries) for read-only methods; backoff 100/300/500ms.
@@ -656,22 +713,35 @@ async function debuggerClick(tabId, x, y) {
         document.addEventListener('click', window.__bmcpClickListener, true);
       })()`,
     });
-    // 1. mouseMoved first (triggers hover state, required by some frameworks)
-    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-      type: 'mouseMoved', x, y,
-    });
-    await new Promise(r => setTimeout(r, 30));
-    // 2. mousePressed + mouseReleased. The `buttons` bitmask (1 while pressed,
-    //    0 on release) plus a small press→release gap are REQUIRED for Chrome to
-    //    synthesize a *trusted* 'click' from the pair. Without them, web-components
-    //    that gate on the trusted click event (Google Ads, Material Web) never fire.
-    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-      type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1,
-    });
-    await new Promise(r => setTimeout(r, 30));
-    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-      type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1,
-    });
+    // 1-2. Real mouse events, when they can be delivered at all. The window this
+    //    tab lives in is checked first: a window already known not to accept them
+    //    is not asked again for a while, because the answer takes five seconds and
+    //    the synthetic path below produces the same outcome immediately. The probe
+    //    itself runs on a short deadline for the same reason.
+    const winId = (await chrome.tabs.get(tabId).catch(() => null))?.windowId;
+    if (!trustedInputLikelyDead(winId)) {
+      const press = async () => {
+        // mouseMoved first (triggers hover state, required by some frameworks)
+        await cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+        await new Promise(r => setTimeout(r, 30));
+        // The `buttons` bitmask (1 while pressed, 0 on release) plus a small
+        // press→release gap are REQUIRED for Chrome to synthesize a *trusted*
+        // 'click' from the pair. Without them, web-components that gate on the
+        // trusted click event (Google Ads, Material Web) never fire.
+        await cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
+        await new Promise(r => setTimeout(r, 30));
+        await cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
+      };
+      try {
+        await Promise.race([
+          press(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('trusted-input-unavailable')), TRUSTED_PROBE_MS)),
+        ]);
+        noteTrustedInputWorked(winId);
+      } catch {
+        noteTrustedInputFailed(winId);
+      }
+    }
     // 3. Framework fallback — only if the captured target is STILL connected (i.e.
     //    the trusted click in step 2 did not already handle it). Settle delay lets
     //    SPA re-renders (Google Ads) detach the element first. Fires a full pointer
