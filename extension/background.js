@@ -920,6 +920,17 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
     return out;
   };
 
+  // Reads through the same resolver a fill writes through, so a value is taken
+  // from exactly the element a write would have landed on — not a second,
+  // differently-behaved lookup that could pick a different node.
+  if (op === 'read') {
+    const el = resolve(selOrExpected);
+    if (!el) return { found: false };
+    const attr = extra && extra.attribute;
+    const v = attr ? el.getAttribute(attr) : readVal(el);
+    return { found: true, value: v == null ? null : String(v), tag: el.tagName, type: (el.type || '').toLowerCase() };
+  }
+
   if (op === 'locate') {
     const el = resolve(selOrExpected);
     if (!el) return { found: false };
@@ -1237,7 +1248,7 @@ async function scriptingClick(tabId, selector) {
 
 // Try executeScript first, fall back to debugger on CSP error
 async function safeExecuteScript(tabId, func, args = [], world = 'MAIN') {
-  try {
+  const attempt = async () => {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
       func,
@@ -1245,13 +1256,38 @@ async function safeExecuteScript(tabId, func, args = [], world = 'MAIN') {
       ...(world === 'MAIN' ? { world: 'MAIN' } : {}),
     });
     return { result: result.result, usedDebugger: false };
+  };
+  try {
+    return await attempt();
   } catch (e) {
     if (e.message?.includes('Content Security Policy') || e.message?.includes('unsafe-eval')) {
       // CSP blocked — this is expected on Google, Stripe, Slack
       return { cspBlocked: true };
     }
+    // The frame was swapped out mid-navigation. Acting immediately after a page
+    // change is normal, and the old frame going away is not a failure of the
+    // action — waiting for the new document and trying once more is what the
+    // caller would otherwise have to do by hand, badly.
+    if (/Frame with ID \d+ was removed|No frame with id|The tab was closed|Cannot access contents/.test(e.message || '')) {
+      await waitForTabReady(tabId, 5000).catch(() => {});
+      try { return await attempt(); } catch (e2) { throw e2; }
+    }
     throw e;
   }
+}
+
+// Resolves once the tab has a document that can be injected into, or when the
+// wait runs out — callers treat a timeout as "try anyway and report honestly".
+async function waitForTabReady(tabId, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t.status === 'complete') return true;
+    } catch { return false; }
+    await new Promise(r => setTimeout(r, 120));
+  }
+  return false;
 }
 
 // ── Smart Selector Resolution ─────────────────────────────────────────────
@@ -3801,66 +3837,75 @@ async function dispatchCore(port, method, params) {
     // Azure-secret night: the agent must be able to move a credential from page to
     // field without the value ever entering the LLM context or transcript.
 
-    case 'copy_to_clipboard': {
+    // A holding slot inside the browser, not the system clipboard. Every paste
+    // target is a field on a page, so the OS clipboard buys nothing and costs a
+    // lot: it needs the window focused (it is not, during automation) and it
+    // hands the value to every other application on the machine. This keeps the
+    // value in session storage, which is memory-backed and gone when the browser
+    // closes, and no action ever returns the content.
+    case 'clipboard': {
+      const act = params.action || 'copy';
       const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
-      const parsed = parseSelector(params.selector);
-      if (parsed.type === 'text') {
-        return { ok: false, error: 'copy_to_clipboard requires a CSS selector (text= selectors not supported for value extraction)' };
-      }
-      const attr = params.attribute || null;
-      const evalRes = await cdpSend(tab.id, 'Runtime.evaluate', {
-        expression: `(() => {
-          const el = document.querySelector(${JSON.stringify(parsed.selector)});
-          if (!el) return null;
-          ${attr ? `return el.getAttribute(${JSON.stringify(attr)});`
-                 : `return ('value' in el && el.value) ? el.value : (el.textContent || '').trim();`}
-        })()`,
-        returnByValue: true,
-      });
-      const value = evalRes?.result?.value;
-      if (value == null) return { ok: false, error: 'Element not found or empty: ' + params.selector };
-      const clip = await chrome.runtime.sendMessage({ type: 'bmcp_clipboard', op: 'write', text: String(value) });
-      if (!clip?.ok) return { ok: false, error: 'clipboard write failed: ' + (clip?.error || 'unknown') };
-      // NEVER return the value itself.
-      return { ok: true, copied_chars: String(value).length, source: attr ? `attribute:${attr}` : 'value/text' };
-    }
+      const SLOT = 'bmcp_held_value';
+      const held = async () => (await chrome.storage.session.get(SLOT))[SLOT] ?? null;
 
-    case 'paste_from_clipboard': {
-      const tab = await getSessionTab(port);
-      if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
-      const clip = await chrome.runtime.sendMessage({ type: 'bmcp_clipboard', op: 'read' });
-      if (!clip?.ok) return { ok: false, error: 'clipboard read failed: ' + (clip?.error || 'unknown') };
-      const text = params.trim === false ? clip.text : (clip.text || '').trim();
-      if (!text) return { ok: false, error: 'clipboard is empty' };
-      const parsed = parseSelector(params.selector);
-      if (parsed.type === 'text') {
-        const el = await resolveElement(tab.id, params.selector);
-        if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
-        await debuggerClick(tab.id, el.x, el.y);
-        await new Promise(r => setTimeout(r, 100));
-        await debuggerType(tab.id, text);
-      } else {
-        await debuggerFill(tab.id, parsed.selector, text);
+      if (act === 'copy') {
+        if (!params.selector) return { ok: false, error: 'copy needs a selector for the element to take the value from' };
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: 'MAIN', func: bmcpFillOp,
+          args: ['read', params.selector, BMCP_TAG, { attribute: params.attribute || null }],
+        });
+        const found = r?.result;
+        if (!found?.found) return { ok: false, error: 'Element not found: ' + params.selector };
+        const value = found.value;
+        if (value == null || value === '') return { ok: false, error: 'That element holds no value to copy: ' + params.selector };
+        await chrome.storage.session.set({ [SLOT]: String(value) });
+        // Confirmed by reading the slot back, so a copy never reports success
+        // while the next paste would find nothing.
+        const back = await held();
+        if (back !== String(value)) return { ok: false, error: 'the value could not be confirmed after copying' };
+        // NEVER the value itself.
+        return { ok: true, copied_chars: String(value).length, source: params.attribute ? `attribute:${params.attribute}` : 'value/text' };
       }
-      // NEVER return the pasted content.
-      return { ok: true, pasted_chars: text.length };
-    }
 
-    case 'clipboard_stats': {
-      const clip = await chrome.runtime.sendMessage({ type: 'bmcp_clipboard', op: 'read' });
-      if (!clip?.ok) return { ok: false, error: 'clipboard read failed: ' + (clip?.error || 'unknown') };
-      const t = clip.text || '';
-      const trimmed = t.trim();
-      return {
-        ok: true,
-        length: t.length,
-        trimmed_length: trimmed.length,
-        has_whitespace: /\s/.test(trimmed),
-        looks_like_uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed),
-        looks_like_url: /^https?:\/\//i.test(trimmed),
-        // NEVER the content itself.
-      };
+      if (act === 'paste') {
+        if (!params.selector) return { ok: false, error: 'paste needs a selector for the field to write into' };
+        const raw = await held();
+        if (raw == null) return { ok: false, error: 'Nothing is held. Copy a value first.' };
+        const text = params.trim === false ? raw : raw.trim();
+        if (!text) return { ok: false, error: 'the held value is empty' };
+        // Goes through fill, so it gets the same focus checks and read-back as
+        // any other write, rather than a second, weaker path into the page.
+        const res = await dispatchCore(port, 'fill', { selector: params.selector, value: text, verbose: false });
+        if (res?.ok === false || res?.found === false) {
+          return { ok: false, error: res.error || 'the field could not be filled', field: params.selector };
+        }
+        // NEVER the pasted content.
+        return { ok: true, pasted_chars: text.length, field: res.tag || params.selector, verified: res.verified !== false };
+      }
+
+      if (act === 'inspect') {
+        const t = (await held()) ?? '';
+        const trimmed = t.trim();
+        return {
+          ok: true,
+          holding: t.length > 0,
+          length: t.length,
+          trimmed_length: trimmed.length,
+          has_whitespace: /\s/.test(trimmed),
+          looks_like_uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed),
+          looks_like_url: /^https?:\/\//i.test(trimmed),
+          // NEVER the content itself.
+        };
+      }
+
+      if (act === 'clear') {
+        await chrome.storage.session.remove(SLOT);
+        return { ok: true, cleared: true };
+      }
+
+      return { ok: false, error: `Unknown clipboard action "${act}". Use copy, paste, inspect or clear.` };
     }
 
     case 'double_click': {
@@ -6238,6 +6283,20 @@ async function dispatchCore(port, method, params) {
         const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => true });
         scriptingOk = r?.result === true;
       } catch {}
+      // The two reasons a page stops responding that are not faults at all: it is
+      // asking for a person. Reported here so the answer arrives with the
+      // diagnosis, rather than needing a separate call to go looking for it.
+      // Both checks inject rather than attaching the debugger: a diagnostic that
+      // changes the state it is reporting on is worse than no diagnostic.
+      let captcha = null, wall = null;
+      if (scriptingOk) {
+        try {
+          const [c] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: bmcpDetectCaptchaLight });
+          if (c?.result?.found) captcha = c.result;
+        } catch {}
+        wall = await detectAuthWall(tab.id).catch(() => null);
+        if (!wall?.auth_wall) wall = null;
+      }
       return {
         ok: true,
         active_tab: { id: tab.id, url: tab.url, title: tab.title },
@@ -6245,7 +6304,11 @@ async function dispatchCore(port, method, params) {
         debugger_attached: debuggerAttachedReal,
         scripting_works: scriptingOk,
         ready: scriptingOk,
-        hint: !scriptingOk ? (!tab.url || tab.url.startsWith('about:') || tab.url.startsWith('chrome://')
+        ...(captcha ? { captcha } : {}),
+        ...(wall ? { auth_wall: { detected: wall.evidence, url: wall.url } } : {}),
+        hint: captcha ? 'A CAPTCHA is on the page. It cannot be solved from here, and it is there precisely to require a person — tell the user what is blocking the flow, let them clear it in the browser, then continue.' :
+              wall ? `The page is asking for authentication (${wall.evidence}). Tell the user, let them sign in, then continue. Automation cannot get past this on its own.` :
+              !scriptingOk ? (!tab.url || tab.url.startsWith('about:') || tab.url.startsWith('chrome://')
                 ? `Active tab is a blank placeholder (${tab.url || 'about:blank'}) — injection is impossible there by design, and this is NOT a fault. Navigate to a real page first.`
                 : 'Scripting injection failing — tab may still be loading, or is a protected page.') :
               !debuggerAttachedReal ? 'Debugger not currently attached (attaches on demand for clicks/keys). If clicks fail with attach errors, another automation extension may be holding the debugger — disable it or use browser_reattach_debugger.' :
@@ -6299,6 +6362,31 @@ async function dispatchCore(port, method, params) {
 }
 
 // ── CAPTCHA Detection & Solving Helpers ─────────────────────────────────────
+
+// Injected. Reports which CAPTCHA is present and whether a challenge is actually
+// showing — a widget sitting idle on the page is not what blocked the flow, an
+// open challenge is, and the two need different things said to the user.
+function bmcpDetectCaptchaLight() {
+  const vis = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 20 && r.height > 20 && getComputedStyle(el).visibility !== 'hidden';
+  };
+  const types = [];
+  let challenging = false;
+  const rc = document.querySelector('iframe[src*="recaptcha/api2/anchor"], iframe[src*="recaptcha/enterprise/anchor"]');
+  const rcChal = document.querySelector('iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha/enterprise/bframe"]');
+  if (rc || document.querySelector('.g-recaptcha')) types.push('reCAPTCHA v2');
+  if (document.querySelector('script[src*="recaptcha/api.js?render="]')) types.push('reCAPTCHA v3');
+  if (vis(rcChal)) challenging = true;
+  const hc = document.querySelector('iframe[src*="hcaptcha.com"], .h-captcha');
+  if (hc) { types.push('hCaptcha'); if (vis(hc)) challenging = true; }
+  const ts = document.querySelector('iframe[src*="challenges.cloudflare.com"], .cf-turnstile');
+  if (ts) { types.push('Cloudflare Turnstile'); if (vis(ts)) challenging = true; }
+  const fc = document.querySelector('iframe[src*="funcaptcha"], iframe[src*="arkoselabs"]');
+  if (fc) { types.push('FunCaptcha'); if (vis(fc)) challenging = true; }
+  return { found: types.length > 0, types, challenge_visible: challenging };
+}
 
 async function detectCaptcha(tabId) {
   try {
