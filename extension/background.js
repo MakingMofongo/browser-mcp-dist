@@ -1,3 +1,9 @@
+// The two decisions that destroy something when they are wrong — abandoning a
+// connection, and replacing the offscreen document — live in one file with no
+// chrome APIs in them, so they can be tested without a browser. Both have already
+// shipped a fault that would have been worse than what they were fixing.
+importScripts('heartbeat-policy.js');
+
 /**
  * Agent360 Browser MCP — Background Service Worker
  *
@@ -211,7 +217,7 @@ function persistSessions() {
 // Get the active tab for this session (last navigated), or create one.
 // activate=false (default): runs in background — no focus stealing.
 // activate=true: only for commands that NEED visible tab (screenshot, ask_user, navigate, execute_script).
-async function getSessionTab(port, activate = false) {
+async function getSessionTab(port) {
   const session = getSession(port);
   let target = null;
   // Remember our OWN about:blank placeholder so we reuse it instead of spawning another
@@ -220,6 +226,12 @@ async function getSessionTab(port, activate = false) {
   const consider = (tab) => {
     if (!tab) return false;
     if (tab.url.startsWith('chrome://')) return false;
+    // A page belonging to an extension — ours or anyone's — cannot be driven:
+    // Chrome refuses to attach a debugger to another extension's page, and every
+    // action on it fails with an attach error that reads like debugger contention
+    // rather than what it is. Picking one is how a session ends up unable to do
+    // anything while looking like it has a perfectly good tab.
+    if (tab.url.startsWith('chrome-extension://') || tab.url.startsWith('edge://') || tab.url.startsWith('devtools://')) return false;
     if (tab.url.startsWith('about:')) { if (!blankFallback) blankFallback = tab; return false; }
     return true;
   };
@@ -262,29 +274,15 @@ async function getSessionTab(port, activate = false) {
     await addTabToSession(port, target.id);
     session.activeTabId = target.id;
     persistSessions();
-    // fall through to the activate branch (SC-3: previously returned early, skipping it)
   }
 
-  // Activate the tab WITHOUT stealing the user's focus (FIX-1). This is a BACKGROUND tool:
-  // screenshot/press_key run constantly, so we must NOT chrome.windows.update({focused:true})
-  // here — that yanked Chrome to the foreground on every action. We only (a) un-minimize a
-  // minimized window (needed so it can composite) and (b) make the tab active within its
-  // window. The truly-occluded (covered) case is handled as a bounded last-resort
-  // raise-and-restore inside the screenshot handler only.
-  if (activate) {
-    try {
-      if (target.windowId != null) {
-        const win = await chrome.windows.get(target.windowId).catch(() => null);
-        if (win && win.state === 'minimized') {
-          await chrome.windows.update(target.windowId, { state: 'normal' }); // no focused:true
-        }
-      }
-      if (!target.active) await chrome.tabs.update(target.id, { active: true });
-      await new Promise(r => setTimeout(r, 150));
-      target = await chrome.tabs.get(target.id);
-    } catch { /* best-effort; capture path surfaces the real error */ }
-  }
-
+  // Nothing below here changes what anybody is looking at. This used to make its
+  // own tab active before every action, and the screenshot path went further and
+  // raised the window too, so a page could be taken away from somebody mid-video
+  // and taken again as soon as they switched back. Whatever it bought was not
+  // worth that, and mostly it bought nothing: real input needs the window focused
+  // as well, which it is not when somebody is using another application, so the
+  // synthetic path did the work regardless.
   return target;
 }
 
@@ -293,14 +291,13 @@ async function getSessionTab(port, activate = false) {
 // Track which tabs have debugger attached to avoid repeated attach/detach
 const debuggerAttached = new Set();
 
-// Chrome does not route CDP Input.* events (mouse, keys, insertText) to a tab that
-// is not the ACTIVE tab of its window — the command succeeds, the page sees nothing,
-// and everything silently degrades to the synthetic/native fallbacks. Measured on
-// Chrome 150: identical click on the same element is 'synthetic-fallback' while the
-// tab is backgrounded and 'trusted' once it is active. So every tool that dispatches
-// real input activates its tab first. This activates the TAB within its window only —
-// it never calls windows.update({focused:true}), so it does not pull Chrome in front
-// of whatever the user is doing.
+// Chrome does not route CDP Input.* events to a tab that is not the active one in
+// its window, and will not deliver them to a window that is not focused either.
+// Both conditions have to hold, and the second is not ours to arrange — so this no
+// longer tries. Every one of these tools has a synthetic path that works on a
+// backgrounded tab, each of them verified against the page rather than assumed,
+// and that is what runs. The list is kept because these are the tools that would
+// use real input if it happened to be available.
 const INPUT_METHODS = new Set([
   'click', 'fill', 'double_click', 'right_click', 'click_xy', 'press_key',
   'select_option', 'set_date', 'set_combobox', 'hover', 'paste_from_clipboard',
@@ -1064,6 +1061,9 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
       found: true, isCE: !!el.isContentEditable, tag: el.tagName,
       type: (el.type || '').toLowerCase(), before: String(before),
       focused: active === el,
+      // Whether the document has focus at all, which decides whether typing can be
+      // trusted to land where it is aimed.
+      docFocused: document.hasFocus(),
       focus_landed_on: active === el ? null : ((active && (active.tagName + (active.name ? '[name=' + active.name + ']' : ''))) || 'none'),
       x: r.x + r.width / 2, y: r.y + r.height / 2,
       inShadow: el.getRootNode() !== document,
@@ -1187,7 +1187,19 @@ async function fillElementDeep(tabId, selector, value, opts = {}) {
   // 2. Trusted typing ONLY when focus verifiably landed on our element. Otherwise
   //    keystrokes would go to whatever else holds focus — the Gmail failure.
   let method = null, typedTrusted = false;
-  if (info.focused && !info.isCE) {
+  // Only when the document actually has focus. In a window that does not, calling
+  // focus() on an element sets document.activeElement and fires no focus event at
+  // all — so a page that moves focus away has not done it yet, and the check made
+  // beforehand passes honestly. Delivering the keystrokes is itself what gives the
+  // document focus, which runs those pending handlers and moves focus as the text
+  // arrives, putting it in whatever the page preferred. No check made in advance
+  // can see that coming, because the act of typing is what causes it.
+  //
+  // So this is not guarded against, it is avoided: with no document focus the
+  // value goes in through the setter, which writes to the element we tagged and
+  // cannot be redirected. Nothing is lost — real keystrokes were not being
+  // delivered to an unfocused window anyway.
+  if (info.focused && info.docFocused && !info.isCE) {
     try {
       await debuggerAttach(tabId);
       // Re-confirm focus immediately before typing — the gap between the focus
@@ -1687,6 +1699,14 @@ async function resolveElement(tabId, selectorStr) {
 
 // ── Offscreen Document Setup ───────────────────────────────────────────────
 
+// Consecutive unanswered pings, kept in session storage rather than a variable.
+// The service worker is evicted between alarms, so an in-memory count would reset
+// to zero almost every tick and never reach the threshold — the check would look
+// careful and never actually fire.
+const MISS_KEY = 'bmcp_offscreen_misses';
+const getMisses = async () => (await chrome.storage.session.get(MISS_KEY))[MISS_KEY] || 0;
+const setMisses = (n) => chrome.storage.session.set({ [MISS_KEY]: n });
+
 async function ensureOffscreen() {
   const existing = await chrome.offscreen.hasDocument();
   if (!existing) {
@@ -1695,6 +1715,41 @@ async function ensureOffscreen() {
       reasons: ['WORKERS'],
       justification: 'Maintain persistent WebSocket connection to local MCP server',
     });
+    return;
+  }
+  // A document that exists is not a document that works, and this is the only
+  // thing that ever brings the connection back. Asking hasDocument() and stopping
+  // there is why a wedged offscreen document stayed wedged for four and a half
+  // hours: it existed the whole time, so the watchdog had nothing to do.
+  //
+  // Ask it whether it is alive instead. Nothing answering means the page is gone
+  // or its script has died, and neither recovers on its own — so it is replaced.
+  const alive = await Promise.race([
+    chrome.runtime.sendMessage({ type: 'bmcp_offscreen_ping' }).then((r) => r?.alive === true).catch(() => false),
+    new Promise((r) => setTimeout(() => r(false), 2000)),
+  ]);
+
+  // Two strikes, because the costs are not symmetric: replacing the document drops
+  // every session's connection at once, and a single missed reply proves very
+  // little — it only takes the worker being busy at the wrong moment. The rule
+  // itself is in heartbeat-policy.js so it can be tested; this part only carries
+  // the count, which has to survive the worker being evicted between checks.
+  const verdict = self.bmcpHeartbeatPolicy.offscreenVerdict({ answered: alive, misses: await getMisses() });
+  await setMisses(verdict.misses);
+  if (!verdict.replace) {
+    if (!alive) console.warn('[bmcp] offscreen document did not answer; checking again before replacing it');
+    return;
+  }
+  {
+    try { await chrome.offscreen.closeDocument(); } catch {}
+    try {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['WORKERS'],
+        justification: 'Maintain persistent WebSocket connection to local MCP server',
+      });
+      console.warn('[bmcp] offscreen document was not responding; replaced it');
+    } catch (e) { console.error('[bmcp] could not replace the offscreen document:', e); }
   }
 }
 
@@ -3429,7 +3484,7 @@ async function dispatchObserved(port, method, params) {
   }
   let before = null, tabId = null;
   try {
-    const t = await getSessionTab(port, true);
+    const t = await getSessionTab(port);
     tabId = t.id;
     before = await pageSignature(tabId);
   } catch { /* observation is best-effort and must never block the action */ }
@@ -3517,7 +3572,7 @@ async function dispatchCore(port, method, params) {
   // Real input only reaches ACTIVE tabs (see INPUT_METHODS above). Activating here,
   // once, means every input tool gets trusted events instead of silently degrading.
   if (INPUT_METHODS.has(method)) {
-    try { await getSessionTab(port, true); } catch {}
+    try { await getSessionTab(port); } catch {}
   }
   switch (method) {
     case 'navigate': {
@@ -3767,7 +3822,7 @@ async function dispatchCore(port, method, params) {
       // getSessionTab(…, true) is focus-NEUTRAL now: it un-minimizes + activates the tab
       // but does NOT steal window focus (FIX-1). Screenshots run constantly, so the common
       // path must never yank Chrome to the foreground.
-      const tab = await getSessionTab(port, true);
+      const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://') || tab.url.startsWith('about:')) {
         throw new Error(`Cannot screenshot ${tab.url.split(':')[0]}: pages — navigate to a real page first`);
       }
@@ -3792,34 +3847,18 @@ async function dispatchCore(port, method, params) {
         }
       };
 
-      // Attempt 1 — focus-neutral. Handles the vast majority (background-but-visible window).
+      // Nothing here raises a window or changes which tab is showing. The browser
+      // belongs to whoever is using it. CDP captures a window that is behind
+      // another one; when even that fails there is no frame to be had, and the
+      // honest answer is to say so rather than take over the screen to get one.
       try {
         return await tryCapture();
-      } catch (firstErr) {
-        // Both methods failed → the window is genuinely OCCLUDED (covered by other windows),
-        // so Chrome's compositor produced no frames. LAST RESORT ONLY: raise the window to
-        // de-occlude it, capture, then RESTORE the user's previously-focused window. This
-        // focus-steal happens ONLY in the rare covered case — never on a normal screenshot.
-        const prev = await chrome.windows.getLastFocused().catch(() => null);
-        try {
-          await chrome.windows.update(tab.windowId, { focused: true, state: 'normal' });
-          await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
-          await new Promise(r => setTimeout(r, 250)); // let it composite
-          return await tryCapture();
-        } catch (secondErr) {
-          throw new Error(
-            `Screenshot failed after focus-neutral AND raised attempts. ` +
-            `First: ${firstErr?.message || firstErr}. Raised: ${secondErr?.message || secondErr}. ` +
-            `If both say "image readback failed" the GPU compositor is not producing frames — ` +
-            `disable Chrome hardware acceleration (chrome://settings/system) as a last resort.`
-          );
-        } finally {
-          // Give focus back to the user's previous Chrome window (best-effort; getLastFocused
-          // only sees Chrome windows, so a non-Chrome IDE can't be re-focused programmatically).
-          if (prev && prev.id != null && prev.id !== tab.windowId) {
-            await chrome.windows.update(prev.id, { focused: true }).catch(() => {});
-          }
-        }
+      } catch (err) {
+        throw new Error(
+          'Could not capture this tab: Chrome is producing no frames for its window, which happens when it is ' +
+          'minimised or fully covered. Bring it into view and try again. ' +
+          `(${err?.message || err})`
+        );
       }
     }
 
@@ -4012,7 +4051,7 @@ async function dispatchCore(port, method, params) {
     }
 
     case 'fill': {
-      const tab = await getSessionTab(port, true);
+      const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       if (typeof params.value !== 'string') return { ok: false, error: 'value (string) required' };
       // The clipboard slot marks a value taken out of a password field, so a
@@ -4310,7 +4349,7 @@ async function dispatchCore(port, method, params) {
 
     case 'press_key': {
       // v1.22: activate tab so key-event lands in foreground (otherwise Chrome routes to active tab)
-      const tab = await getSessionTab(port, true);
+      const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       const key = params.key; // e.g. "Enter", "Tab", "Escape", "ArrowDown"
       const modifiers = (params.ctrl ? 2 : 0) | (params.alt ? 1 : 0) | (params.shift ? 8 : 0) | (params.meta ? 4 : 0);
@@ -4682,7 +4721,7 @@ async function dispatchCore(port, method, params) {
       // across 11 minutes while the login never happened — the caller had no way
       // to tell "submitted", "rejected with errors", and "nothing happened" apart,
       // so it burned 20s waits and eventually asked the user to click it himself.
-      const tab = await getSessionTab(port, true);
+      const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       const timeout = Math.min(60000, params.timeout || 15000);
 
@@ -4895,7 +4934,7 @@ async function dispatchCore(port, method, params) {
       // credentialed fetching cover both, and the bytes come back for the caller
       // to write somewhere it can actually read them.
       const mode = params.mode || (params.url ? 'url' : 'pdf');
-      const tab = await getSessionTab(port, true);
+      const tab = await getSessionTab(port);
 
       if (mode === 'url') {
         if (!params.url) return { ok: false, error: 'url required for mode:"url"' };
@@ -6196,7 +6235,7 @@ async function dispatchCore(port, method, params) {
       // Real drag: press, move in steps (frameworks need intermediate moves), release.
       // Falls back to HTML5 drag-and-drop events for dropzones that listen for
       // dragstart/dragover/drop rather than raw mouse movement.
-      const tab = await getSessionTab(port, true);
+      const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       const from = params.from_selector ? await resolveElement(tab.id, params.from_selector)
         : (typeof params.from_x === 'number' ? { x: params.from_x, y: params.from_y } : null);
@@ -6289,7 +6328,7 @@ async function dispatchCore(port, method, params) {
     case 'triple_click': {
       // Selects a whole line/paragraph — the reliable way to replace text in
       // rich editors before typing.
-      const tab = await getSessionTab(port, true);
+      const tab = await getSessionTab(port);
       const el = await resolveElement(tab.id, params.selector);
       if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
       await debuggerAttach(tab.id);
@@ -6332,7 +6371,7 @@ async function dispatchCore(port, method, params) {
       // FORCE-GRAB recovery: activate the tab (input only reaches active tabs),
       // clear every stale claim, re-attach, then PROVE it by dispatching a real
       // mouse event and checking whether the page actually received it.
-      const tab = await getSessionTab(port, true);
+      const tab = await getSessionTab(port);
       const before = await chrome.debugger.getTargets().then(
         ts => ts.find(t => t.tabId === tab.id)?.attached || false).catch(() => null);
       debuggerAttached.delete(tab.id);
@@ -6866,22 +6905,24 @@ async function dispatchCore(port, method, params) {
     }
 
     case 'get_new_tab': {
-      // The remembered id can be stale (the popup closed, or the service worker
-      // restarted and lost it). Fall back to the newest tab in the window that no
-      // session owns — which is what "the tab that just opened" means in practice.
+      // Only a tab this session caused to exist. It used to take the newest tab in
+      // the browser that no session had claimed, which is any tab the user had just
+      // opened — so asking for "the new tab" pulled somebody's Linear tab out of
+      // their window and into this session's group. A popup opened by one of our
+      // pages has openerTabId pointing at it; a tab somebody opened themselves does
+      // not, and is not ours to take.
       const session = getSession(port);
-      const owned = new Set([...sessions.values()].flatMap(s => [...s.tabIds]));
       let tab = null;
-      if (lastCreatedTabId) tab = await chrome.tabs.get(lastCreatedTabId).catch(() => null);
-      if (!tab) {
-        const all = await chrome.tabs.query({});
-        const candidates = all
-          .filter(t => !owned.has(t.id) && !(t.url || '').startsWith('chrome://'))
-          .sort((a, b) => b.id - a.id); // Chrome ids increase monotonically
-        tab = candidates[0] || null;
+      if (lastCreatedTabId) {
+        const t = await chrome.tabs.get(lastCreatedTabId).catch(() => null);
+        if (t && t.openerTabId && session.tabIds.has(t.openerTabId)) tab = t;
       }
       if (!tab) {
-        return { ok: false, error: 'No unclaimed tab found. List everything with browser_list_tabs({all:true}) and attach one with browser_attach_tab.' };
+        return {
+          ok: false,
+          error: 'No tab has been opened by this session. This only returns a popup or target=_blank window that one of this session\'s own pages opened.',
+          hint: 'To work in a tab you already have open, pass its id to browser_attach_tab — browser_list_tabs({all:true}) lists them. Nothing is adopted without being asked for.',
+        };
       }
       await addTabToSession(port, tab.id);
       session.activeTabId = tab.id;

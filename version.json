@@ -1,9 +1,10 @@
 {
-  "version": "2.4.50",
+  "version": "2.4.51",
   "extension_id": "apcaminghehhiafleljmdhjhfimndngf",
   "files": [
     "background.js",
     "console-capture.js",
+    "heartbeat-policy.js",
     "icons/icon-128.png",
     "icons/icon-16.png",
     "icons/icon-48.png",
