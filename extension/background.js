@@ -983,19 +983,34 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
   // Scoped to the target's own form and capped: on a page with hundreds of fields
   // walking all of them costs real time on every keystroke-level call, and stray
   // text lands in a sibling field, not across the document.
-  const snapshotFields = (target) => {
-    const scope = (target && target.closest && target.closest('form, [role="form"], fieldset')) || document;
+  // The whole document, not the target's own form. A form-scoped check is one
+  // layout away from missing the thing it exists to catch: a compose surface is
+  // not a form, portals put the damage in a sidebar or a collapsed wizard step,
+  // and a hidden field is the worst case of all — invisible to this and to a
+  // person watching, and serialised at submit regardless. Shadow roots and
+  // same-origin frames are walked for the same reason.
+  const snapshotFields = () => {
     const out = [];
-    for (const e of scope.querySelectorAll('input, textarea, [contenteditable="true"]')) {
-      const t = e.tagName;
-      if (t !== 'INPUT' && t !== 'TEXTAREA' && !e.isContentEditable) continue;
-      if (e.type === 'hidden') continue;
-      // Password fields are watched too — a stray write into one is the least
-      // visible and least recoverable place a value can land. The snapshot stays
-      // in the page, which already has the value, and the report names the field
-      // without ever carrying what is in it.
-      out.push({ el: e, v: String(readVal(e)), secret: e.type === 'password' });
-      if (out.length >= 80) break;
+    const collect = (root) => {
+      if (out.length >= 400) return;
+      let nodes = [];
+      try { nodes = root.querySelectorAll('input, textarea, select, [contenteditable="true"]'); } catch (e) { return; }
+      for (const e of nodes) {
+        if (out.length >= 400) return;
+        const t = e.tagName;
+        if (t !== 'INPUT' && t !== 'TEXTAREA' && t !== 'SELECT' && !e.isContentEditable) continue;
+        // Password fields are watched: a stray value landing in one is the least
+        // visible and least recoverable place it can go. The snapshot never
+        // leaves the page, and the report names the field, never its contents.
+        out.push({ el: e, v: String(readVal(e)), secret: e.type === 'password', hidden: e.type === 'hidden' });
+      }
+      try {
+        for (const n of root.querySelectorAll('*')) if (n.shadowRoot) collect(n.shadowRoot);
+      } catch (e) {}
+    };
+    collect(document);
+    for (const f of document.querySelectorAll('iframe')) {
+      try { if (f.contentDocument) collect(f.contentDocument); } catch (e) { /* cross-origin */ }
     }
     return out;
   };
@@ -1014,7 +1029,7 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
   if (op === 'locate') {
     const el = resolve(selOrExpected);
     if (!el) return { found: false };
-    window.__bmcpFieldSnapshot = snapshotFields(el);
+    window.__bmcpFieldSnapshot = snapshotFields();
     try { el.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e) {}
     walkAll(document, []).forEach(n => { if (n.hasAttribute && n.hasAttribute(TAG)) n.removeAttribute(TAG); });
     el.setAttribute(TAG, '1');
@@ -1022,6 +1037,29 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
     try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) {} }
     const active = (el.getRootNode() && el.getRootNode().activeElement) || document.activeElement;
     const r = el.getBoundingClientRect();
+    // Describe the element that is about to be written to, in the terms a person
+    // reading the page would use. "filled" tells the caller nothing it can check;
+    // the field's label and the section it sits in let it notice for itself that
+    // the recipient box was about to receive a subject line.
+    const describe = (n) => {
+      const lbl = (n.labels && n.labels[0] && n.labels[0].textContent) ||
+        n.getAttribute('aria-label') ||
+        (n.getAttribute('aria-labelledby') && (document.getElementById(n.getAttribute('aria-labelledby'))?.textContent)) ||
+        n.getAttribute('placeholder') || '';
+      const container = n.closest && n.closest('form, [role="form"], fieldset, section, [role="dialog"], [role="row"], tr, li');
+      let where = '';
+      if (container) {
+        const heading = container.querySelector && container.querySelector('legend, h1, h2, h3, h4, [role="heading"]');
+        where = (heading && heading.textContent.trim()) ||
+          (container.getAttribute && (container.getAttribute('aria-label') || container.getAttribute('name') || container.id)) || '';
+        if (!where && container.tagName === 'TR') where = (container.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+      }
+      return {
+        label: String(lbl).replace(/\s+/g, ' ').trim().slice(0, 60) || null,
+        field: n.name || n.id || null,
+        in: where ? String(where).replace(/\s+/g, ' ').trim().slice(0, 60) : null,
+      };
+    };
     return {
       found: true, isCE: !!el.isContentEditable, tag: el.tagName,
       type: (el.type || '').toLowerCase(), before: String(before),
@@ -1029,6 +1067,7 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
       focus_landed_on: active === el ? null : ((active && (active.tagName + (active.name ? '[name=' + active.name + ']' : ''))) || 'none'),
       x: r.x + r.width / 2, y: r.y + r.height / 2,
       inShadow: el.getRootNode() !== document,
+      target: describe(el),
     };
   }
 
@@ -1036,6 +1075,10 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
     const el = tagged();
     if (!el) return { gone: true };
     const expected = selOrExpected;
+    // Whether what is being written came out of a password field. A secret
+    // reaching somewhere it was not meant to go is a different problem from an
+    // ordinary value doing so, and gets a different answer.
+    const fromSecret = !!(extra && extra.fromSecret);
     let now = String(readVal(el));
     let repaired = false;
     // Checked whether or not the target came out right. A write that lands where
@@ -1043,20 +1086,28 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
     // everything reads as success, and the wrong field carries the value into
     // whatever gets saved. Only skipping this when the target is wrong would miss
     // precisely that case.
+    // Counted rather than detected. Once the whole document is in scope, a value
+    // like "Yes" or "India" legitimately appears in a dozen places already, and
+    // asking whether it is present anywhere reports those every time. Comparing
+    // how many fields held it before against how many hold it now leaves only
+    // what this write actually put there, and removes the need for a minimum
+    // length or any other guess about which matches are real.
     const collateral = [];
     const alsoChanged = [];
+    const secretLeak = [];
     const snap = window.__bmcpFieldSnapshot || [];
     for (const s of snap) {
       if (!s.el || !s.el.isConnected || s.el === el) continue;
       const cur = String(readVal(s.el));
       if (cur === s.v) continue;
-      const name = (s.el.name || s.el.id || s.el.tagName);
-      if (cur.includes(expected) || (expected.length > 2 && expected.includes(cur) && cur.length > 2)) {
-        // Deliberately not repaired. Writing the old value back fires the
-        // framework's change handlers and can flip the form to unsaved-changes,
-        // and a silent repair hides the fact that a write went somewhere it
-        // should not have. Report it and let the caller stop.
-        collateral.push(name + ' (received this value)');
+      const held = (v) => v === expected || (expected.length > 0 && v.includes(expected));
+      const name = (s.el.name || s.el.id || s.el.tagName) + (s.hidden ? ' (a hidden field)' : '');
+      if (held(cur) && !held(s.v)) {
+        // Not repaired. Writing the old value back fires the framework's change
+        // handlers and can flip a form to unsaved-changes, and a silent repair
+        // hides that a write went somewhere it should not have.
+        if (fromSecret) secretLeak.push(name);
+        else collateral.push(name);
       } else if (s.secret) {
         alsoChanged.push(name + (cur ? ' (a password field changed)' : ' (a password field was cleared)'));
       } else {
@@ -1080,7 +1131,7 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
       repaired = true;
       now = String(readVal(el));
     }
-    return { gone: false, value: now, repaired, collateral, also_changed: alsoChanged.slice(0, 6) };
+    return { gone: false, value: now, repaired, collateral, secret_leak: secretLeak, also_changed: alsoChanged.slice(0, 6) };
   }
 
   if (op === 'ambiguity') {
@@ -1105,7 +1156,7 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
   return { gone: false, value: v };
 }
 
-async function fillElementDeep(tabId, selector, value) {
+async function fillElementDeep(tabId, selector, value, opts = {}) {
   if (typeof selector !== 'string' || !selector.trim()) {
     return { ok: false, error: 'selector is required and must be a string (received ' + (selector === undefined ? 'nothing' : typeof selector) + ')' };
   }
@@ -1152,7 +1203,7 @@ async function fillElementDeep(tabId, selector, value) {
   }
 
   // 3. Read back FROM THE TAGGED ELEMENT (never the selector) and repair if needed.
-  const verify = await inject(['verify', value, BMCP_TAG, typedTrusted]);
+  const verify = await inject(['verify', value, BMCP_TAG, { typedTrusted, fromSecret: !!opts?.fromSecret }]);
 
   if (verify?.gone) return { ok: false, error: 'Element left the DOM during fill (page re-rendered) — re-read the page and retry.' };
   if (verify?.repaired) method = typedTrusted ? 'trusted-input+setter-repair' : 'native-setter';
@@ -1169,20 +1220,31 @@ async function fillElementDeep(tabId, selector, value) {
   const show = (v) => v == null ? null : (redacted ? `[${v.length} chars]` : String(v).slice(0, 120));
 
   return {
-    // A write that also landed somewhere else is not a success, whatever the
-    // target now holds. Reporting ok:true with a warning beside it invites the
-    // caller straight past the one thing that needed stopping for.
-    ok: accepted && !verify?.collateral?.length,
+    // A secret that reached somewhere it was not meant to go fails the write. An
+    // ordinary value doing so does not: mirrors are ordinary — confirm-email,
+    // billing-same-as-shipping, one model bound to two inputs — and halting on
+    // them would stop a five hundred row run on its second row to prevent a
+    // problem it does not have. The asymmetry in cost decides it. A mirror
+    // reported and passed over costs a line of output; a password sitting in a
+    // field that will be saved and displayed cannot be taken back.
+    ok: accepted && !verify?.secret_leak?.length,
     method: method || 'native-setter',
     value_before: show(info.before),
     value_after: show(finalValue),
     focus_verified: !!info.focused,
+    // What was actually written to, so a caller can see for itself that the field
+    // it got is the field it meant.
+    ...(info.target && (info.target.label || info.target.field) ? { wrote_into: info.target } : {}),
     ...(info.inShadow ? { shadow_dom: true } : {}),
     ...(info.focused ? {} : { focus_drift: info.focus_landed_on }),
     ...(verify?.also_changed?.length ? { also_changed: verify.also_changed } : {}),
+    ...(verify?.secret_leak?.length ? {
+      secret_written_elsewhere: verify.secret_leak,
+      error: `A value taken from a password field also reached ${verify.secret_leak.join(', ')}. Those fields are not treated as secret, so it can now be read on screen, captured in a screenshot and saved with the form. Clear them before going on. Nothing was rewritten automatically, because doing so fires the page's own handlers and hides that it happened.`,
+    } : {}),
     ...(verify?.collateral?.length ? {
-      collateral_written: verify.collateral,
-      error: "This value also landed in another field. Nothing was rewritten, because repairing it would fire the page's own change handlers and hide the fault. Check those fields before continuing.",
+      also_received_this_value: verify.collateral,
+      note: `This value also reached ${verify.collateral.join(', ')}. That is what a mirrored field looks like — a confirm-email box, or two inputs bound to one model — and it is usually the page working as intended. It is reported rather than treated as a fault, because it is also what a misdirected write looks like.`,
     } : {}),
     ...(accepted ? {} : {
       error: finalValue === '' || finalValue == null
@@ -3825,7 +3887,10 @@ async function dispatchCore(port, method, params) {
       const tab = await getSessionTab(port, true);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       if (typeof params.value !== 'string') return { ok: false, error: 'value (string) required' };
-      return await fillElementDeep(tab.id, params.selector, params.value);
+      // The clipboard slot marks a value taken out of a password field, so a
+      // paste of one that lands somewhere unintended is treated as the leak it
+      // is rather than as an ordinary mirrored value.
+      return await fillElementDeep(tab.id, params.selector, params.value, { fromSecret: !!params.__fromSecret });
     }
 
     case 'fill_legacy': {
@@ -4332,7 +4397,10 @@ async function dispatchCore(port, method, params) {
         if (!found?.found) return { ok: false, error: 'Element not found: ' + params.selector };
         const value = found.value;
         if (value == null || value === '') return { ok: false, error: 'That element holds no value to copy: ' + params.selector };
-        await chrome.storage.session.set({ [SLOT]: String(value) });
+        // Whether this came out of a password field travels with it, so a paste
+        // that lands somewhere unintended is judged as a leaked secret rather than
+        // as an ordinary mirrored value.
+        await chrome.storage.session.set({ [SLOT]: String(value), [SLOT + '_secret']: found.type === 'password' });
         // Confirmed by reading the slot back, so a copy never reports success
         // while the next paste would find nothing.
         const back = await held();
@@ -4349,7 +4417,8 @@ async function dispatchCore(port, method, params) {
         if (!text) return { ok: false, error: 'the held value is empty' };
         // Goes through fill, so it gets the same focus checks and read-back as
         // any other write, rather than a second, weaker path into the page.
-        const res = await dispatchCore(port, 'fill', { selector: params.selector, value: text, verbose: false });
+        const wasSecret = (await chrome.storage.session.get(SLOT + '_secret'))[SLOT + '_secret'] === true;
+        const res = await dispatchCore(port, 'fill', { selector: params.selector, value: text, verbose: false, __fromSecret: wasSecret });
         if (res?.ok === false || res?.found === false) {
           return { ok: false, error: res.error || 'the field could not be filled', field: params.selector };
         }
@@ -4373,7 +4442,7 @@ async function dispatchCore(port, method, params) {
       }
 
       if (act === 'clear') {
-        await chrome.storage.session.remove(SLOT);
+        await chrome.storage.session.remove([SLOT, SLOT + '_secret']);
         return { ok: true, cleared: true };
       }
 
