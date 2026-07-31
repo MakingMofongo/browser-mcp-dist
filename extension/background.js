@@ -958,15 +958,11 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
         const cur = String(readVal(s.el));
         if (cur === s.v) continue;
         if (cur.includes(expected) || expected.includes(cur)) {
-          if (s.el.isContentEditable) s.el.textContent = s.v;
-          else {
-            const p = s.el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const dd = Object.getOwnPropertyDescriptor(p, 'value');
-            if (dd && dd.set) dd.set.call(s.el, s.v); else s.el.value = s.v;
-          }
-          s.el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-          s.el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-          collateral.push((s.el.name || s.el.id || s.el.tagName) + ' (restored)');
+          // Deliberately not repaired. Writing the old value back fires the
+          // framework's change handlers and can flip the form to unsaved-changes,
+          // and a silent repair hides the fact that a write went somewhere it
+          // should not have. Report it and let the caller stop.
+          collateral.push((s.el.name || s.el.id || s.el.tagName) + ' (received this value)');
         }
       }
     }
@@ -1078,7 +1074,10 @@ async function fillElementDeep(tabId, selector, value) {
     focus_verified: !!info.focused,
     ...(info.inShadow ? { shadow_dom: true } : {}),
     ...(info.focused ? {} : { focus_drift: info.focus_landed_on }),
-    ...(verify?.collateral?.length ? { collateral_restored: verify.collateral } : {}),
+    ...(verify?.collateral?.length ? {
+      collateral_written: verify.collateral,
+      error: "This value also landed in another field. Nothing was rewritten, because repairing it would fire the page's own change handlers and hide the fault. Check those fields before continuing.",
+    } : {}),
     ...(accepted ? {} : {
       error: finalValue === '' || finalValue == null
         ? 'Value did not persist — the framework reverted it after input (common on Salesforce LWC / React controlled inputs). The field will likely save blank.'
@@ -4091,15 +4090,25 @@ async function dispatchCore(port, method, params) {
               i++; j++;
               continue;
             }
+            // A field the page marks required is part of every run by definition.
+            // Demoting one to conditional produces the worst outcome available: a
+            // replay that completes successfully with the form half empty.
+            const mark = (st) => ({ ...st, optional: st.target?.required ? undefined : true });
             const oldAhead = j < newS.length ? oldS.slice(i).findIndex(s => key(s) === key(newS[j])) : -1;
-            if (oldAhead > 0) { out.push({ ...oldS[i], optional: true }); i++; continue; }
-            if (j < newS.length) { out.push({ ...newS[j], optional: true }); j++; continue; }
-            if (i < oldS.length) { out.push({ ...oldS[i], optional: true }); i++; continue; }
+            if (oldAhead > 0) { out.push(mark(oldS[i])); i++; continue; }
+            if (j < newS.length) { out.push(mark(newS[j])); j++; continue; }
+            if (i < oldS.length) { out.push(mark(oldS[i])); i++; continue; }
           }
           steps = out;
+          const cond = steps.filter(s => s.optional).length;
+          const ratio = steps.length ? cond / steps.length : 0;
           merged = {
-            required: steps.filter(s => !s.optional).length,
-            conditional: steps.filter(s => s.optional).length,
+            required: steps.length - cond,
+            conditional: cond,
+            alignment: ratio > 0.5 ? 'low' : ratio > 0.25 ? 'partial' : 'high',
+            ...(ratio > 0.5 ? {
+              warning: 'More than half the steps came out conditional, which usually means the two passes were different flows rather than variations of one — a portal that renames or reorders fields per record type does this. Replay would skip most steps and still report success. Re-record instead of extending.',
+            } : {}),
           };
         }
 
@@ -4173,12 +4182,24 @@ async function dispatchCore(port, method, params) {
         };
 
         const postsSeen = () => (networkLogs.get((getSession(port).activeTabId) || -1) || [])
-          .filter(e => e.method === 'POST' || e.method === 'PUT').length;
+          .filter(e => (e.method === 'POST' || e.method === 'PUT' || e.method === 'PATCH') &&
+            // 3xx to a sign-in page, 401 and 403 all mean the write was refused.
+            !(e.status >= 300 && e.status < 400) && e.status !== 401 && e.status !== 403)
+          .length;
 
         await persist();
         let stopped = null;
         for (const entry of ledger.rows) {
           if (entry.status === 'done' || entry.status === 'skipped') continue;
+          if (entry.status === 'in_progress' && !params.retry_committed) {
+            // The worker stopped while this row was running — Chrome evicts an idle
+            // service worker, and a long run is exactly that workload. Whether it
+            // completed is unknown, so it is not silently repeated.
+            entry.status = 'needs_review';
+            entry.note = 'the run stopped while this row was in flight, so its outcome is unknown. Check the site, then mark it done or re-run with retry_committed:true.';
+            await persist();
+            continue;
+          }
           // A row that failed after something was posted may already exist on the
           // other side. Re-running it blind is how a resume creates duplicates, so
           // it is held for review unless the caller says to retry it anyway.
@@ -4188,6 +4209,9 @@ async function dispatchCore(port, method, params) {
             await persist();
             continue;
           }
+          entry.status = 'in_progress';
+          entry.started_at = new Date().toISOString();
+          await persist();
           const postsBefore = postsSeen();
           let r = await dispatchCore(port, 'replay', { ...params, rows: undefined, resume: undefined, row: entry.row, verbose: false });
           let kind = r.ok ? null : classify(r.diverged_at);
@@ -4309,7 +4333,51 @@ async function dispatchCore(port, method, params) {
       }
 
       const SUBMITISH = /^(submit|save|continue|next|apply|pay|confirm|send|finish|create|book|place order|sign in|log in)\b/i;
+      // What this run put into the page, so it can be checked against what the
+      // page is showing before anything is committed.
+      const expectations = {};
       const dryRun = params.dry_run === true;
+
+      // Holding back steps whose label reads like a commit is a guess, and it is
+      // wrong in both directions: a "Next" that saves server-side commits anyway,
+      // while a "Submit" that only opens a confirmation modal commits nothing. So
+      // during a dry run the guarantee is enforced at the network layer — anything
+      // that is not a safe method is blocked outright and reported.
+      const blocked = [];
+      let dryGuard = null;
+      if (dryRun) {
+        const tabForGuard = await getSessionTab(port);
+        dryGuard = { tabId: tabForGuard.id, handler: null };
+        try {
+          await debuggerAttach(dryGuard.tabId);
+          dryGuard.handler = (source, method, evt) => {
+            if (source.tabId !== dryGuard.tabId || method !== 'Fetch.requestPaused') return;
+            const m = (evt.request?.method || 'GET').toUpperCase();
+            const safe = m === 'GET' || m === 'HEAD' || m === 'OPTIONS';
+            if (safe) {
+              chrome.debugger.sendCommand({ tabId: dryGuard.tabId }, 'Fetch.continueRequest', { requestId: evt.requestId }).catch(() => {});
+            } else {
+              blocked.push({ method: m, url: (evt.request?.url || '').slice(0, 200) });
+              chrome.debugger.sendCommand({ tabId: dryGuard.tabId }, 'Fetch.failRequest', { requestId: evt.requestId, errorReason: 'Aborted' }).catch(() => {});
+            }
+          };
+          chrome.debugger.onEvent.addListener(dryGuard.handler);
+          await cdpSend(dryGuard.tabId, 'Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+        } catch (e) {
+          if (dryGuard.handler) chrome.debugger.onEvent.removeListener(dryGuard.handler);
+          dryGuard = null;
+          return {
+            ok: false, flow: params.name,
+            error: `Could not arm the dry run: ${e?.message || e}. Without request blocking a dry run cannot promise it will not commit, so it was not started.`,
+          };
+        }
+      }
+      const disarm = async () => {
+        if (!dryGuard) return;
+        try { await cdpSend(dryGuard.tabId, 'Fetch.disable', {}); } catch {}
+        if (dryGuard.handler) chrome.debugger.onEvent.removeListener(dryGuard.handler);
+        dryGuard = null;
+      };
 
       for (let i = 0; i < flow.steps.length; i++) {
         const step = flow.steps[i];
@@ -4319,13 +4387,19 @@ async function dispatchCore(port, method, params) {
         // against real validation before anything is submitted for the first time.
         // Recorded clicks that look like a submit are held back too, since a click
         // is what commits on forms that were not recorded via browser_submit.
-        if (dryRun) {
-          const looksCommitting = step.method === 'submit' ||
-            (step.method === 'click' && SUBMITISH.test(String(step.target?.name || '')));
-          if (looksCommitting) {
-            results.push({ step: i, method: step.method, ok: true, held: 'not submitted (dry run)' });
-            continue;
-          }
+        if (dryRun && step.method === 'submit') {
+          // Run the real submit path, including its own control detection — a dry
+          // run that takes a different code path is not testing the thing that will
+          // run for real. The network guard is what prevents the commit, so the
+          // outcome it reports is expected to be a failure to progress.
+          const out = await dispatchCore(port, 'submit', { ...p, timeout: Math.min(p.timeout || 6000, 6000) })
+            .catch(e => ({ ok: false, error: e?.message }));
+          results.push({
+            step: i, method: 'submit', ok: true,
+            dry: 'submitted with state-changing requests blocked',
+            attempted: out?.outcome || (out?.error ? 'error: ' + out.error : 'unknown'),
+          });
+          continue;
         }
 
         // Re-point the step at whatever now matches its recorded identity.
@@ -4334,10 +4408,21 @@ async function dispatchCore(port, method, params) {
           const [r] = await chrome.scripting.executeScript({
             target: { tabId: tab.id }, world: 'MAIN', func: bmcpResolvePortable, args: [step.target],
           }).catch(() => [null]);
-          const res = r?.result;
+          let res = r?.result;
+          if (!res?.found && step.optional) {
+            // Frameworks render sections after the page has otherwise settled, so a
+            // single look decides "branch not taken" for a step that was about to
+            // exist. Re-check briefly before skipping.
+            for (let attempt = 0; attempt < 6 && !res?.found; attempt++) {
+              await new Promise(r2 => setTimeout(r2, 150));
+              const [again] = await chrome.scripting.executeScript({
+                target: { tabId: (await getSessionTab(port)).id }, world: 'MAIN',
+                func: bmcpResolvePortable, args: [step.target],
+              }).catch(() => [null]);
+              res = again?.result;
+            }
+          }
           if (!res?.found) {
-            // A conditional step's target being absent is the branch not applying,
-            // not a break. This is what lets one flow cover data-dependent forks.
             if (step.optional) {
               results.push({ step: i, method: step.method, ok: true, skipped: 'condition not present' });
               continue;
@@ -4352,7 +4437,33 @@ async function dispatchCore(port, method, params) {
         // Per-run values: a row key matching the field's name wins over the recorded one.
         if (step.method === 'fill' && row && step.target?.name) {
           const key = Object.keys(row).find(k => k.toLowerCase() === String(step.target.name).toLowerCase());
-          if (key) p.value = String(row[key]);
+          if (key) { p.value = String(row[key]); expectations[step.target.name] = p.value; }
+        }
+
+        // A structurally perfect run can still submit the previous row's values if a
+        // control never re-rendered. Check the page against the row before committing.
+        if (step.method === 'submit' && params.verify !== false && Object.keys(expectations).length) {
+          let v = null, verifyError = null;
+          try { v = await dispatchCore(port, 'verify_data', { expect: expectations }); }
+          catch (e) { verifyError = e?.message || String(e); }
+          // A check that quietly does nothing when it fails is worse than no check,
+          // because the run then reports success it never established.
+          if (verifyError || (v && v.ok !== true && !v.mismatched)) {
+            diverged = {
+              step: i, method: step.method, reason: 'verification-unavailable',
+              detail: verifyError || v?.error,
+              note: 'Stopped before committing: the page could not be checked against this row, so there is no basis for saying the data is right.',
+            };
+            break;
+          }
+          if (v && v.ok === false && v.mismatched?.length) {
+            diverged = {
+              step: i, method: step.method, reason: 'data-mismatch',
+              mismatched: v.mismatched,
+              note: 'Stopped before committing: the page is not showing the values this row supplied.',
+            };
+            break;
+          }
         }
 
         let out;
@@ -4378,6 +4489,7 @@ async function dispatchCore(port, method, params) {
 
       // With nothing submitted, the useful answer is whether it WOULD have been
       // accepted — so read the validation state the form is now showing.
+      await disarm();
       let validation;
       if (dryRun && !diverged && tab) {
         try {
@@ -4397,15 +4509,112 @@ async function dispatchCore(port, method, params) {
       return {
         ok: !diverged && (!validation || validation.would_submit !== false),
         flow: params.name,
-        ...(dryRun ? { dry_run: true, committed: false } : {}),
+        ...(dryRun ? {
+          dry_run: true,
+          committed: false,
+          blocked_requests: blocked.length,
+          ...(blocked.length ? { blocked: blocked.slice(0, 8) } : { note: 'No state-changing request was attempted, so this flow commits nothing before the steps that were run.' }),
+        } : {}),
         ...(validation ? { validation } : {}),
         steps_run: results.length,
         steps_total: flow.steps.length,
+        ...(Object.keys(expectations).length ? { verified_fields: Object.keys(expectations) } : {}),
         results: params.verbose ? results : undefined,
         url: tab?.url,
         ...(diverged ? {
           diverged_at: diverged,
           hint: 'The page no longer matches the recording at this step. Inspect with browser_form_state or browser_read_page, handle this case, then continue or re-record.',
+        } : {}),
+      };
+    }
+
+    case 'verify_data': {
+      // Structural checks catch a missing field. They do not catch a row completing
+      // with the previous row's values because a control never re-rendered — that
+      // run looks perfect. This compares what the page is actually showing against
+      // what it is supposed to show, in form fields and in rendered summary text.
+      const tab = await getSessionTab(port);
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot read chrome:// pages');
+      const expect = params.expect;
+      if (!expect || typeof expect !== 'object' || !Object.keys(expect).length) {
+        return { ok: false, error: 'expect required: an object of label to value, for example {"Email":"a@b.com"}' };
+      }
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, world: 'MAIN',
+        args: [expect, params.selector || null, params.exact === true],
+        func: (expect, rootSel, exact) => {
+          const root = rootSel ? document.querySelector(rootSel) : document.body;
+          if (!root) return { error: 'scope not found: ' + rootSel };
+          const norm = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+          const loose = (v) => norm(v).toLowerCase().replace(/[^a-z0-9]/g, '');
+          const same = (a, b) => exact ? norm(a) === norm(b) : (loose(a) === loose(b) || (loose(b) && loose(a).includes(loose(b))));
+
+          const labelOf = (el) => {
+            const a = el.getAttribute && el.getAttribute('aria-label');
+            if (a) return a;
+            if (el.labels && el.labels[0]) return el.labels[0].textContent;
+            if (el.placeholder) return el.placeholder;
+            const w = el.closest && el.closest('label');
+            if (w) return w.textContent;
+            return el.name || el.id || '';
+          };
+          const controls = [...root.querySelectorAll('input, select, textarea')]
+            .filter(el => el.type !== 'hidden');
+
+          // Label/value pairs as a review page renders them.
+          const pairs = [];
+          for (const dl of root.querySelectorAll('dl')) {
+            const dts = [...dl.querySelectorAll('dt')], dds = [...dl.querySelectorAll('dd')];
+            dts.forEach((dt, i) => dds[i] && pairs.push([norm(dt.textContent), norm(dds[i].textContent)]));
+          }
+          for (const tr of root.querySelectorAll('tr')) {
+            const cells = [...tr.children];
+            if (cells.length === 2) pairs.push([norm(cells[0].textContent), norm(cells[1].textContent)]);
+          }
+          for (const el of root.querySelectorAll('*')) {
+            if (el.children.length !== 0) continue;
+            const t = norm(el.textContent);
+            const m = /^(.{2,60}?)\s*[:：]\s*(.+)$/.exec(t);
+            if (m) pairs.push([m[1], m[2]]);
+          }
+
+          const out = [];
+          for (const [key, want] of Object.entries(expect)) {
+            const ctl = controls.find(c => same(labelOf(c), key) || loose(labelOf(c)).includes(loose(key)));
+            if (ctl) {
+              const got = ctl.tagName === 'SELECT'
+                ? (ctl.selectedOptions[0]?.text || '')
+                : (ctl.type === 'checkbox' || ctl.type === 'radio' ? (ctl.checked ? 'true' : 'false') : ctl.value);
+              out.push({ field: key, expected: norm(want), found: norm(got), source: 'form field', match: same(got, want) });
+              continue;
+            }
+            const pair = pairs.find(([k]) => same(k, key) || loose(k).includes(loose(key)));
+            if (pair) {
+              out.push({ field: key, expected: norm(want), found: pair[1], source: 'summary text', match: same(pair[1], want) });
+              continue;
+            }
+            // Last resort: is the value present anywhere at all?
+            const anywhere = loose(root.innerText || '').includes(loose(want));
+            out.push({
+              field: key, expected: norm(want), found: null,
+              source: anywhere ? 'value appears on the page but not against this label' : 'not found',
+              match: false,
+            });
+          }
+          return { checks: out };
+        },
+      });
+      const r = res?.result;
+      if (!r || r.error) return { ok: false, error: r?.error || 'Could not read the page' };
+      const mismatched = r.checks.filter(c => !c.match);
+      return {
+        ok: mismatched.length === 0,
+        checked: r.checks.length,
+        matched: r.checks.length - mismatched.length,
+        mismatched: mismatched.length ? mismatched : undefined,
+        checks: params.verbose ? r.checks : undefined,
+        ...(mismatched.length ? {
+          hint: 'The page is not showing what it was given. A control that did not re-render keeps the previous value, which a structural check cannot see.',
         } : {}),
       };
     }
