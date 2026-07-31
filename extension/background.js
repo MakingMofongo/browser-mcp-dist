@@ -4019,20 +4019,69 @@ async function dispatchCore(port, method, params) {
       if (action === 'start') {
         if (!params.name) return { ok: false, error: 'name required' };
         const tab = await getSessionTab(port).catch(() => null);
-        recording.set(port, { name: params.name, steps: [], start_url: tab?.url || null });
-        return { ok: true, recording: params.name, note: 'Actions that change the page are being recorded. Call again with action:"stop" to save.' };
+        const extend = params.mode === 'extend';
+        if (extend && !flows[params.name]) return { ok: false, error: `No flow named ${params.name} to extend.` };
+        recording.set(port, {
+          name: params.name, steps: [], start_url: tab?.url || null,
+          extend, previous: extend ? flows[params.name].steps : null,
+        });
+        return {
+          ok: true, recording: params.name,
+          mode: extend ? 'extend' : 'new',
+          note: extend
+            ? 'Recording another pass. On stop, steps that appear in both passes stay required and steps that appear in only one become conditional, so the flow can cover a variation without treating it as a break.'
+            : 'Actions that change the page are being recorded. Call again with action:"stop" to save.',
+        };
       }
       if (action === 'stop') {
         const rec = recording.get(port);
         if (!rec) return { ok: false, error: 'Not recording' };
         recording.delete(port);
         if (!rec.steps.length) return { ok: false, error: 'Nothing was recorded — no page-changing actions ran.' };
-        flows[rec.name] = { steps: rec.steps, start_url: rec.start_url, saved: new Date().toISOString() };
+
+        let steps = rec.steps;
+        let merged = null;
+        if (rec.extend && rec.previous) {
+          // Align the two passes. A step seen both times is part of every run; a
+          // step seen in only one is a branch that depends on the data, so it is
+          // marked conditional and skipped at replay when its target is absent.
+          const key = (s) => `${s.method}|${s.target?.name || s.params?.selector || ''}|${s.target?.tag || ''}`;
+          const oldS = rec.previous, newS = rec.steps;
+          const out = [];
+          let i = 0, j = 0;
+          while (i < oldS.length || j < newS.length) {
+            if (i < oldS.length && j < newS.length && key(oldS[i]) === key(newS[j])) {
+              out.push({ ...oldS[i], optional: oldS[i].optional === true ? undefined : oldS[i].optional });
+              delete out[out.length - 1].optional;
+              i++; j++;
+              continue;
+            }
+            const oldAhead = j < newS.length ? oldS.slice(i).findIndex(s => key(s) === key(newS[j])) : -1;
+            if (oldAhead > 0) { out.push({ ...oldS[i], optional: true }); i++; continue; }
+            if (j < newS.length) { out.push({ ...newS[j], optional: true }); j++; continue; }
+            if (i < oldS.length) { out.push({ ...oldS[i], optional: true }); i++; continue; }
+          }
+          steps = out;
+          merged = {
+            required: steps.filter(s => !s.optional).length,
+            conditional: steps.filter(s => s.optional).length,
+          };
+        }
+
+        flows[rec.name] = {
+          steps,
+          start_url: flows[rec.name]?.start_url || rec.start_url,
+          saved: new Date().toISOString(),
+          passes: (flows[rec.name]?.passes || 0) + 1,
+        };
         await chrome.storage.local.set({ bmcpFlows: flows });
         return {
-          ok: true, saved: rec.name, steps: rec.steps.length,
-          fields: rec.steps.filter(s => s.method === 'fill').map(s => s.target?.name || s.params?.selector).filter(Boolean),
-          note: 'Replay with browser_replay. Field values can be overridden per run by passing row keys that match the field names above.',
+          ok: true, saved: rec.name, steps: steps.length,
+          ...(merged || {}),
+          fields: steps.filter(s => s.method === 'fill').map(s => s.target?.name || s.params?.selector).filter(Boolean),
+          note: merged
+            ? 'Conditional steps run only when their target is present, so one flow covers both variations.'
+            : 'Replay with browser_replay. Record another pass with mode:"extend" to teach the flow a variation.',
         };
       }
       return { ok: false, error: `Unknown action: ${action}` };
@@ -4187,6 +4236,12 @@ async function dispatchCore(port, method, params) {
           }).catch(() => [null]);
           const res = r?.result;
           if (!res?.found) {
+            // A conditional step's target being absent is the branch not applying,
+            // not a break. This is what lets one flow cover data-dependent forks.
+            if (step.optional) {
+              results.push({ step: i, method: step.method, ok: true, skipped: 'condition not present' });
+              continue;
+            }
             diverged = { step: i, method: step.method, reason: 'target-not-found', looked_for: step.target };
             break;
           }
