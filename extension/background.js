@@ -913,8 +913,12 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
     for (const e of scope.querySelectorAll('input, textarea, [contenteditable="true"]')) {
       const t = e.tagName;
       if (t !== 'INPUT' && t !== 'TEXTAREA' && !e.isContentEditable) continue;
-      if (e.type === 'hidden' || e.type === 'password') continue;
-      out.push({ el: e, v: String(readVal(e)) });
+      if (e.type === 'hidden') continue;
+      // Password fields are watched too — a stray write into one is the least
+      // visible and least recoverable place a value can land. The snapshot stays
+      // in the page, which already has the value, and the report names the field
+      // without ever carrying what is in it.
+      out.push({ el: e, v: String(readVal(e)), secret: e.type === 'password' });
       if (out.length >= 80) break;
     }
     return out;
@@ -958,23 +962,31 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
     const expected = selOrExpected;
     let now = String(readVal(el));
     let repaired = false;
+    // Checked whether or not the target came out right. A write that lands where
+    // it was aimed AND also leaks into a neighbour is the quiet, expensive kind:
+    // everything reads as success, and the wrong field carries the value into
+    // whatever gets saved. Only skipping this when the target is wrong would miss
+    // precisely that case.
     const collateral = [];
-    if (now !== expected) {
-      // The value is not where we aimed. If trusted keystrokes went somewhere else
-      // (focus moved after we checked), some OTHER field now holds our text — the
-      // Gmail failure, where a subject line overwrote the recipient. Undo it.
-      const snap = window.__bmcpFieldSnapshot || [];
-      for (const s of snap) {
-        if (!s.el || !s.el.isConnected || s.el === el) continue;
-        const cur = String(readVal(s.el));
-        if (cur === s.v) continue;
-        if (cur.includes(expected) || expected.includes(cur)) {
-          // Deliberately not repaired. Writing the old value back fires the
-          // framework's change handlers and can flip the form to unsaved-changes,
-          // and a silent repair hides the fact that a write went somewhere it
-          // should not have. Report it and let the caller stop.
-          collateral.push((s.el.name || s.el.id || s.el.tagName) + ' (received this value)');
-        }
+    const alsoChanged = [];
+    const snap = window.__bmcpFieldSnapshot || [];
+    for (const s of snap) {
+      if (!s.el || !s.el.isConnected || s.el === el) continue;
+      const cur = String(readVal(s.el));
+      if (cur === s.v) continue;
+      const name = (s.el.name || s.el.id || s.el.tagName);
+      if (cur.includes(expected) || (expected.length > 2 && expected.includes(cur) && cur.length > 2)) {
+        // Deliberately not repaired. Writing the old value back fires the
+        // framework's change handlers and can flip the form to unsaved-changes,
+        // and a silent repair hides the fact that a write went somewhere it
+        // should not have. Report it and let the caller stop.
+        collateral.push(name + ' (received this value)');
+      } else if (s.secret) {
+        alsoChanged.push(name + (cur ? ' (a password field changed)' : ' (a password field was cleared)'));
+      } else {
+        // A page reacting to input — a postcode filling in a city — is normal and
+        // is worth mentioning without treating it as a fault.
+        alsoChanged.push(name + (cur ? ' → ' + cur.slice(0, 30) : ' (cleared)'));
       }
     }
     if (now !== expected) {
@@ -992,7 +1004,7 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
       repaired = true;
       now = String(readVal(el));
     }
-    return { gone: false, value: now, repaired, collateral };
+    return { gone: false, value: now, repaired, collateral, also_changed: alsoChanged.slice(0, 6) };
   }
 
   if (op === 'ambiguity') {
@@ -1081,13 +1093,17 @@ async function fillElementDeep(tabId, selector, value) {
   const show = (v) => v == null ? null : (redacted ? `[${v.length} chars]` : String(v).slice(0, 120));
 
   return {
-    ok: accepted,
+    // A write that also landed somewhere else is not a success, whatever the
+    // target now holds. Reporting ok:true with a warning beside it invites the
+    // caller straight past the one thing that needed stopping for.
+    ok: accepted && !verify?.collateral?.length,
     method: method || 'native-setter',
     value_before: show(info.before),
     value_after: show(finalValue),
     focus_verified: !!info.focused,
     ...(info.inShadow ? { shadow_dom: true } : {}),
     ...(info.focused ? {} : { focus_drift: info.focus_landed_on }),
+    ...(verify?.also_changed?.length ? { also_changed: verify.also_changed } : {}),
     ...(verify?.collateral?.length ? {
       collateral_written: verify.collateral,
       error: "This value also landed in another field. Nothing was rewritten, because repairing it would fire the page's own change handlers and hide the fault. Check those fields before continuing.",
