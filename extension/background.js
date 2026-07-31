@@ -3118,6 +3118,74 @@ async function dispatchObserved(port, method, params) {
   return result;
 }
 
+// The evaluator execute_script uses, at module scope so anything that has to run
+// a string of JavaScript goes through the same one. Serialised into the page by
+// chrome.scripting, so it must not close over anything.
+function bmcpRepl(codeStr) {
+        const asErr = (e) => ({ __scriptingError: true, message: String(e?.message || e), name: e?.name });
+        // Under `require-trusted-types-for 'script'` (Gmail, Workspace, banks) the
+        // Function constructor rejects plain strings. Wrap only at the point of
+        // construction: the policy returns a TrustedScript object, and applying it
+        // to codeStr itself broke every string operation performed on the source.
+        const trust = (src) => {
+          try {
+            if (window.trustedTypes && window.trustedTypes.createPolicy) {
+              if (!window.__bmcpTT) {
+                window.__bmcpTT = window.trustedTypes.createPolicy('bmcp-exec', {
+                  createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s,
+                });
+              }
+              if (window.__bmcpTT && window.__bmcpTT.createScript) return window.__bmcpTT.createScript(src);
+            }
+          } catch (e) { /* policy blocked; the debugger path still works */ }
+          return src;
+        };
+        const mkFn = (src) => new Function(trust(src));
+        const tryEval = (build) => {
+          const fn = build();
+          const v = fn();
+          return (v && typeof v.then === 'function')
+            ? v.then(x => ({ __ok: true, value: x }), asErr)  // async rejection → structured error, never unhandled
+            : { __ok: true, value: v };
+        };
+        // REPL "completion value": for statement code, return the LAST expression.
+        // "const a=6; const b=7; a*b" → rewrite tail to "return (a*b)". Only applied
+        // when the tail doesn't start with a statement keyword; syntax errors fall
+        // through to the plain-body variant.
+        const withLastExprReturn = () => {
+          const parts = codeStr.split(/;(?![^(]*\))/);
+          while (parts.length && !parts[parts.length - 1].trim()) parts.pop();
+          if (!parts.length) return null;
+          const tail = parts.pop().trim();
+          if (/^(const|let|var|if|for|while|do|return|function|class|throw|try|switch|break|continue|\})/.test(tail)) return null;
+          return parts.join(';') + ';\nreturn (' + tail + '\n);';
+        };
+        try {
+          return tryEval(() => mkFn('return (' + codeStr + '\n)'));
+        } catch (e1) {
+          if (e1?.name !== 'SyntaxError') return asErr(e1);
+          try {
+            // Await-containing single EXPRESSION ("await fetch(...)"): wrap so the
+            // awaited value is RETURNED, not discarded as a statement.
+            return tryEval(() => mkFn('return (async () => { return (' + codeStr + '\n); })()'));
+          } catch (e1b) {
+            if (e1b?.name !== 'SyntaxError') return asErr(e1b);
+            const rewritten = withLastExprReturn();
+            if (rewritten != null) {
+              try {
+                return tryEval(() => mkFn('return (async () => {\n' + rewritten + '\n})()'));
+              } catch { /* fall through to plain body */ }
+            }
+            try {
+              // Statement code / top-level return: async-body wrap
+              return tryEval(() => mkFn('return (async () => {\n' + codeStr + '\n})()'));
+            } catch (e2) {
+              return asErr(e2);
+            }
+          }
+        }
+}
+
 async function dispatchCore(port, method, params) {
   // Real input only reaches ACTIVE tabs (see INPUT_METHODS above). Activating here,
   // once, means every input tool gets trusted events instead of silently degrading.
@@ -3406,70 +3474,7 @@ async function dispatchCore(port, method, params) {
       // v2.0 REPL semantics: accept full multi-statement code with top-level await.
       // Each scripting world tries (a) expression eval, (b) async-function-body wrap —
       // so `const r = await fetch(...); r.status` and top-level `return x` both work.
-      const replFunc = (codeStr) => {
-        const asErr = (e) => ({ __scriptingError: true, message: String(e?.message || e), name: e?.name });
-        // Under `require-trusted-types-for 'script'` (Gmail, Workspace, banks) the
-        // Function constructor rejects plain strings. Wrap only at the point of
-        // construction: the policy returns a TrustedScript object, and applying it
-        // to codeStr itself broke every string operation performed on the source.
-        const trust = (src) => {
-          try {
-            if (window.trustedTypes && window.trustedTypes.createPolicy) {
-              if (!window.__bmcpTT) {
-                window.__bmcpTT = window.trustedTypes.createPolicy('bmcp-exec', {
-                  createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s,
-                });
-              }
-              if (window.__bmcpTT && window.__bmcpTT.createScript) return window.__bmcpTT.createScript(src);
-            }
-          } catch (e) { /* policy blocked; the debugger path still works */ }
-          return src;
-        };
-        const mkFn = (src) => new Function(trust(src));
-        const tryEval = (build) => {
-          const fn = build();
-          const v = fn();
-          return (v && typeof v.then === 'function')
-            ? v.then(x => ({ __ok: true, value: x }), asErr)  // async rejection → structured error, never unhandled
-            : { __ok: true, value: v };
-        };
-        // REPL "completion value": for statement code, return the LAST expression.
-        // "const a=6; const b=7; a*b" → rewrite tail to "return (a*b)". Only applied
-        // when the tail doesn't start with a statement keyword; syntax errors fall
-        // through to the plain-body variant.
-        const withLastExprReturn = () => {
-          const parts = codeStr.split(/;(?![^(]*\))/);
-          while (parts.length && !parts[parts.length - 1].trim()) parts.pop();
-          if (!parts.length) return null;
-          const tail = parts.pop().trim();
-          if (/^(const|let|var|if|for|while|do|return|function|class|throw|try|switch|break|continue|\})/.test(tail)) return null;
-          return parts.join(';') + ';\nreturn (' + tail + '\n);';
-        };
-        try {
-          return tryEval(() => mkFn('return (' + codeStr + '\n)'));
-        } catch (e1) {
-          if (e1?.name !== 'SyntaxError') return asErr(e1);
-          try {
-            // Await-containing single EXPRESSION ("await fetch(...)"): wrap so the
-            // awaited value is RETURNED, not discarded as a statement.
-            return tryEval(() => mkFn('return (async () => { return (' + codeStr + '\n); })()'));
-          } catch (e1b) {
-            if (e1b?.name !== 'SyntaxError') return asErr(e1b);
-            const rewritten = withLastExprReturn();
-            if (rewritten != null) {
-              try {
-                return tryEval(() => mkFn('return (async () => {\n' + rewritten + '\n})()'));
-              } catch { /* fall through to plain body */ }
-            }
-            try {
-              // Statement code / top-level return: async-body wrap
-              return tryEval(() => mkFn('return (async () => {\n' + codeStr + '\n})()'));
-            } catch (e2) {
-              return asErr(e2);
-            }
-          }
-        }
-      };
+      const replFunc = bmcpRepl;
 
       for (const world of ['ISOLATED', 'MAIN']) {
         try {
@@ -5419,18 +5424,27 @@ async function dispatchCore(port, method, params) {
       const before = await snapshot();
       try {
         await debuggerAttach(tab.id);
-        await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y });
-        await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1 });
-        for (let i = 1; i <= steps; i++) {
-          const t = i / steps;
-          await cdpSend(tab.id, 'Input.dispatchMouseEvent', {
-            type: 'mouseMoved', button: 'left', buttons: 1,
-            x: Math.round(from.x + (to.x - from.x) * t),
-            y: Math.round(from.y + (to.y - from.y) * t),
-          });
-          await new Promise(r => setTimeout(r, 16));
-        }
-        await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 });
+        // A move with a button held waits on the compositor, which produces no
+        // frames for a window that is not in front — the same reason a wheel event
+        // never returns. Under a deadline, so a drag that cannot be delivered
+        // falls through to the drag-and-drop events instead of hanging the caller.
+        await Promise.race([
+          (async () => {
+            await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y });
+            await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1 });
+            for (let i = 1; i <= steps; i++) {
+              const t = i / steps;
+              await cdpSend(tab.id, 'Input.dispatchMouseEvent', {
+                type: 'mouseMoved', button: 'left', buttons: 1,
+                x: Math.round(from.x + (to.x - from.x) * t),
+                y: Math.round(from.y + (to.y - from.y) * t),
+              });
+              await new Promise(r => setTimeout(r, 16));
+            }
+            await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 });
+          })(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('the browser did not accept the mouse drag')), 4000)),
+        ]);
         await new Promise(r => setTimeout(r, 250));
         const after = await snapshot();
         const changed = !before || !after || before.siblings !== after.siblings ||
@@ -5458,9 +5472,17 @@ async function dispatchCore(port, method, params) {
             return { ok: true };
           },
         });
-        return r?.result?.ok
-          ? { ok: true, method: 'html5-dnd-fallback', note: 'trusted mouse drag failed: ' + (e?.message || e) }
-          : { ok: false, error: 'both trusted drag and HTML5 DnD failed: ' + (e?.message || e) };
+        if (!r?.result?.ok) {
+          return { ok: false, error: 'Neither a mouse drag nor drag-and-drop events reached the page: ' + (e?.message || e) };
+        }
+        // Dispatching the events proves nothing about whether the drop was taken.
+        await new Promise(r2 => setTimeout(r2, 250));
+        const after = await snapshot();
+        const moved = !before || !after || before.siblings !== after.siblings ||
+          before.index !== after.index || before.rect[0] !== after.rect[0] || before.rect[1] !== after.rect[1];
+        return moved
+          ? { ok: true, method: 'html5-dnd', verified: !!(before && after), note: 'the mouse drag was not accepted (' + (e?.message || e) + '), so drag-and-drop events were used instead' }
+          : { ok: false, method: 'html5-dnd', error: 'The drag-and-drop events were dispatched but nothing moved. The target may not accept this payload, or the widget listens for real mouse movement — which needs the Chrome window in front.' };
       }
     }
 
@@ -5984,12 +6006,30 @@ async function dispatchCore(port, method, params) {
       }
       const frameId = frames[frameIndex].frameId;
       const code = params.code || 'document.body.innerText.slice(0, 5000)';
-      const [result] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id, frameIds: [frameId] },
-        func: new Function('return (' + code + ')'),
-        world: 'MAIN',
-      });
-      return { result: result.result, frame_url: frames[frameIndex].url };
+      // The code used to be compiled here with the Function constructor, which an
+      // MV3 service worker forbids outright — so this threw a raw Content Security
+      // Policy error on every page and never ran anything. It goes into the frame
+      // as a string now and is compiled there, through the same evaluator
+      // execute_script uses.
+      let last = null;
+      for (const world of ['ISOLATED', 'MAIN']) {
+        try {
+          const [r] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id, frameIds: [frameId] },
+            world, args: [code], func: bmcpRepl,
+          });
+          const v = r?.result;
+          if (v && typeof v === 'object' && v.__ok) {
+            return { ok: true, result: v.value, frame_url: frames[frameIndex].url, frame_index: frameIndex, method: 'scripting-' + world.toLowerCase() };
+          }
+          if (v && typeof v === 'object' && v.__scriptingError) last = v.message;
+        } catch (e) { last = String(e?.message || e); }
+      }
+      return {
+        ok: false, frame_url: frames[frameIndex].url, frame_index: frameIndex,
+        error: `The code could not be run in frame ${frameIndex}` + (last ? `: ${last}` : '.'),
+        hint: 'A cross-origin frame the extension has no access to cannot be reached this way. browser_list_frames shows which frames exist.',
+      };
     }
 
     case 'list_frames': {
