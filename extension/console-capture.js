@@ -55,6 +55,85 @@
     else document.addEventListener('readystatechange', start, { once: true });
   }
 
+  // What the page told the server, recorded here rather than through the debugger.
+  // The point of watching requests is to know what a click actually committed —
+  // which row was deleted, whether Submit went out when Save Draft was meant — and
+  // the debugger is not always attached when a click happens, because a window
+  // that cannot take real input is driven by script instead. Method and address
+  // only: no bodies, no headers, nothing that could carry a credential.
+  if (!window.__bmcpRequests) {
+    // A form post navigates, and the record would die with the document — losing
+    // precisely the request worth keeping. Mutating ones are carried across in
+    // sessionStorage, which is already scoped to this tab and this origin.
+    const CARRY = '__bmcpCarriedRequests';
+    let carried = [];
+    try { carried = JSON.parse(sessionStorage.getItem(CARRY) || '[]'); } catch (e) {}
+    const reqs = Array.isArray(carried) ? carried.slice(-50) : [];
+    window.__bmcpRequests = reqs;
+    let seq = reqs.length ? reqs[reqs.length - 1].n : 0;
+    const note = (method, url, extra) => {
+      try {
+        const m = String(method || 'GET').toUpperCase();
+        const u = String(url || '');
+        // Same-page assets are noise; this exists to show what was committed.
+        if (/\.(png|jpe?g|gif|svg|webp|woff2?|ttf|css|js|ico|map)(\?|$)/i.test(u)) return;
+        reqs.push({ n: ++seq, method: m, url: u.slice(0, 300), ts: Date.now(), ...extra });
+        if (reqs.length > 300) reqs.splice(0, reqs.length - 300);
+        // Only the ones that change something are worth carrying, and only those
+        // pay the cost of writing to storage.
+        if (/^(POST|PUT|PATCH|DELETE)$/.test(m)) {
+          try {
+            const keep = reqs.filter(q => /^(POST|PUT|PATCH|DELETE)$/.test(q.method)).slice(-50);
+            sessionStorage.setItem(CARRY, JSON.stringify(keep));
+          } catch (e) {}
+        }
+        return reqs[reqs.length - 1];
+      } catch (e) { return null; }
+    };
+
+    const origFetch = window.fetch;
+    if (origFetch) {
+      window.fetch = function (input, init) {
+        let url = '', method = 'GET';
+        try {
+          url = typeof input === 'string' ? input : (input && input.url) || '';
+          method = (init && init.method) || (input && input.method) || 'GET';
+        } catch (e) {}
+        const rec = note(method, url);
+        const p = origFetch.apply(this, arguments);
+        try { p.then((r) => { if (rec) rec.status = r.status; }, () => { if (rec) rec.failed = true; }); } catch (e) {}
+        return p;
+      };
+    }
+
+    const XHR = window.XMLHttpRequest;
+    if (XHR && XHR.prototype) {
+      const open = XHR.prototype.open, sendFn = XHR.prototype.send;
+      XHR.prototype.open = function (m, u) { this.__bmcpM = m; this.__bmcpU = u; return open.apply(this, arguments); };
+      XHR.prototype.send = function () {
+        const rec = note(this.__bmcpM, this.__bmcpU);
+        try {
+          this.addEventListener('loadend', () => { if (rec) rec.status = this.status; });
+        } catch (e) {}
+        return sendFn.apply(this, arguments);
+      };
+    }
+
+    if (navigator.sendBeacon) {
+      const beacon = navigator.sendBeacon.bind(navigator);
+      navigator.sendBeacon = function (url) { note('POST', url, { beacon: true }); return beacon.apply(this, arguments); };
+    }
+
+    // A form that posts normally never goes through fetch or XHR, and is the most
+    // consequential request a page makes.
+    document.addEventListener('submit', (e) => {
+      try {
+        const f = e.target;
+        if (f && f.tagName === 'FORM') note(f.method || 'GET', f.action || location.href, { form: true });
+      } catch (err) {}
+    }, true);
+  }
+
   if (window.__mcpConsoleLogs) return; // already installed (SPA soft-nav, double-inject)
   const MAX = 500;
   const logs = [];

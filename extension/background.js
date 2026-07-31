@@ -3220,9 +3220,47 @@ function noteCall(port, method, ms, result) {
   if (callLog.length > CALL_LOG_MAX) callLog.splice(0, callLog.length - CALL_LOG_MAX);
 }
 
+// Actions that can commit something. What the server was told is the only account
+// of what a click did that the page cannot contradict: a wrong-row delete, a
+// Submit where Save Draft was meant, and a click that appeared to work while
+// sending nothing all look identical on screen and different here.
+const COMMITTING = new Set([
+  'click', 'click_xy', 'double_click', 'submit', 'press_key', 'select_option',
+  'set_combobox', 'drag', 'upload_file', 'drop_file', 'dismiss_overlays',
+]);
+const MUTATING_VERB = /^(POST|PUT|PATCH|DELETE)$/;
+
+async function requestMark(tabId) {
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN',
+      func: () => (window.__bmcpRequests && window.__bmcpRequests.length ? window.__bmcpRequests[window.__bmcpRequests.length - 1].n : 0),
+    });
+    return typeof r?.result === 'number' ? r.result : null;
+  } catch { return null; }
+}
+
+async function requestsSince(tabId, mark) {
+  if (mark == null) return null;
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [mark],
+      func: (since) => (window.__bmcpRequests || []).filter(q => q.n > since).map(q => ({ method: q.method, url: q.url, status: q.status, form: q.form })),
+    });
+    return r?.result || null;
+  } catch { return null; }
+}
+
 async function dispatch(port, method, params) {
   const started = Date.now();
   const rec = recording.get(port);
+
+  let tabId = null, mark = null;
+  if (COMMITTING.has(method)) {
+    try { tabId = (await getSessionTab(port)).id; } catch {}
+    if (tabId) mark = await requestMark(tabId);
+  }
+
   let result;
   if (rec && RECORDABLE.has(method)) {
     result = await dispatchInner(port, method, params);
@@ -3230,6 +3268,23 @@ async function dispatch(port, method, params) {
   } else {
     result = await dispatchInner(port, method, params);
   }
+
+  // Reported, not judged. A page that autosaves, searches as you type or posts
+  // analytics fires these constantly, so treating any of them as a fault would
+  // stop a run on ordinary behaviour — the same mistake the mirrored-field check
+  // made. What this buys is that a delete or a submit is no longer invisible.
+  if (mark != null && result && typeof result === 'object') {
+    // Settle first: the request is usually issued from the handler, so reading
+    // immediately catches the click and misses what it caused.
+    await new Promise(r => setTimeout(r, 250));
+    const fired = await requestsSince(tabId, mark);
+    const mutating = (fired || []).filter(q => MUTATING_VERB.test(q.method));
+    if (mutating.length) {
+      result.sent = mutating.slice(0, 6).map(q => `${q.method} ${q.url}` + (q.status ? ` → ${q.status}` : ''));
+      if (mutating.length > 6) result.sent_more = mutating.length - 6;
+    }
+  }
+
   noteCall(port, method, Date.now() - started, result);
   await trackWrite(port, method, params, result);
   return result;
