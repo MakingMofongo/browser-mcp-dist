@@ -2330,10 +2330,32 @@ async function setCombobox(tabId, selector, values, opts = {}) {
         }, [selector]);
       }
 
-      // Type partial query via Input.insertText (bypasses per-keystroke validators)
+      // Type the partial query. Input.insertText is preferred because it looks
+      // like real typing to per-keystroke validators, but Chrome does not
+      // deliver CDP input to a tab that is not in front, and automation almost
+      // always runs on one that is not — so the result is checked and the
+      // native setter finishes the job when nothing arrived.
       const query = val.slice(0, Math.min(queryPrefixLen, val.length));
       await debuggerAttach(tabId);
-      await cdpSend(tabId, 'Input.insertText', { text: query });
+      try { await cdpSend(tabId, 'Input.insertText', { text: query }); } catch {}
+      let typed = await readBackValue(tabId, selector);
+      if (typed !== query) {
+        await safeExecuteScript(tabId, (sel, q) => {
+          const el = document.querySelector(sel);
+          if (!el) return;
+          el.focus();
+          const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(el, q); else el.value = q;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('keyup', { bubbles: true }));
+        }, [selector, query]);
+        typed = await readBackValue(tabId, selector);
+      }
+      if (typed !== query) {
+        results.push({ value: val, ok: false, error: `the query could not be typed into ${selector} — the field holds "${typed}"` });
+        continue;
+      }
 
       // Wait for listbox/options to appear
       let ready = false;
@@ -2402,10 +2424,31 @@ async function setCombobox(tabId, selector, values, opts = {}) {
       }, [val]);
 
       if (click.result?.ok) {
-        results.push({ value: val, ok: true, method: click.result.method, selected: click.result.text });
-        if (multi) {
-          await new Promise(r => setTimeout(r, 250));
+        // The option was clicked, which these widgets do not always act on — a
+        // blur guard can discard it and leave the typed query sitting there.
+        // What the control shows afterwards decides whether it took.
+        await new Promise(r => setTimeout(r, 250));
+        const shown = await safeExecuteScript(tabId, (sel) => {
+          let el = null;
+          try { el = document.querySelector(sel); } catch { return null; }
+          if (!el) return null;
+          const chips = Array.from(el.parentElement ? el.parentElement.querySelectorAll('[class*="chip" i], [class*="tag" i], [class*="multiValue" i], [data-selected="true"], [aria-selected="true"]') : [])
+            .map(c => (c.innerText || c.textContent || '').trim()).filter(Boolean).slice(0, 12);
+          return { value: (el.value || '').trim(), chips, text: (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 120) };
+        }, [selector]);
+        const s = shown?.result;
+        const want = String(val).toLowerCase();
+        const took = !s || `${s.value} ${s.text} ${(s.chips || []).join(' ')}`.toLowerCase().includes(want);
+        if (took) {
+          results.push({ value: val, ok: true, method: click.result.method, selected: click.result.text, verified: !!s });
+        } else {
+          results.push({
+            value: val, ok: false, method: click.result.method,
+            error: `the option was clicked but the control still shows "${s.value || s.text}" — this widget probably needs a real press rather than a click`,
+            shows: s.value || s.text, chips: s.chips,
+          });
         }
+        if (multi) await new Promise(r => setTimeout(r, 250));
       } else {
         results.push({ value: val, ok: false, error: click.result?.error || 'click-failed' });
       }
@@ -3804,6 +3847,17 @@ async function dispatchCore(port, method, params) {
       const vkCode = VK_CODES[key];
       const vkParams = vkCode ? { windowsVirtualKeyCode: vkCode, nativeVirtualKeyCode: vkCode } : {};
 
+      // Chrome delivers key events to the focused renderer widget, which needs the
+      // Chrome window itself to be in front — during automation it is behind the
+      // terminal, so a perfectly dispatched key reaches nothing. Watch for it
+      // arriving instead of assuming, exactly as click does.
+      await safeExecuteScript(tab.id, () => {
+        window.__bmcpKeySeen = null;
+        try { document.removeEventListener('keydown', window.__bmcpKeySpy, true); } catch (e) {}
+        window.__bmcpKeySpy = (ev) => { window.__bmcpKeySeen = { key: ev.key, prevented: false, at: Date.now() }; };
+        document.addEventListener('keydown', window.__bmcpKeySpy, true);
+      });
+
       await debuggerAttach(tab.id);
       try {
         await cdpSend(tab.id, 'Input.dispatchKeyEvent', {
@@ -3821,10 +3875,22 @@ async function dispatchCore(port, method, params) {
           modifiers,
           ...vkParams,
         });
-      } finally {
+      } catch { /* fallback below reports honestly */ } finally {
         await debuggerDetach(tab.id);
       }
-      return { ok: true, key };
+
+      await new Promise(r => setTimeout(r, 80));
+      const landed = await safeExecuteScript(tab.id, bmcpKeyOutcome, [key, modifiers, params.code || key, vkCode || 0, false]);
+      if (landed?.result?.seen) {
+        return { ok: true, key, path: 'trusted', verified: true, ...(landed.result.effect ? { effect: landed.result.effect } : {}) };
+      }
+      // Nothing arrived, so send it in the page instead and say which way it went.
+      const synth = await safeExecuteScript(tab.id, bmcpKeyOutcome, [key, modifiers, params.code || key, vkCode || 0, true]);
+      const s = synth?.result;
+      if (!s?.dispatched) {
+        return { ok: false, key, error: 'The key could not be delivered. Chrome only routes real key events to a focused window, and the page did not accept a synthetic one either.' };
+      }
+      return { ok: true, key, path: 'synthetic', verified: !!s.effect, ...(s.effect ? { effect: s.effect } : { note: 'The key was delivered but nothing on the page visibly responded to it.' }) };
     }
 
     case 'scroll': {
@@ -6575,6 +6641,79 @@ async function dispatchCore(port, method, params) {
 }
 
 // ── CAPTCHA Detection & Solving Helpers ─────────────────────────────────────
+
+// Injected twice per press: first to ask whether the real key arrived, then, if
+// it did not, to deliver one in the page and report what it actually did.
+function bmcpKeyOutcome(key, modifiers, code, vk, deliver) {
+  const active = () => {
+    let el = document.activeElement;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+    return el;
+  };
+  const seen = window.__bmcpKeySeen;
+  if (!deliver) {
+    try { document.removeEventListener('keydown', window.__bmcpKeySpy, true); } catch (e) {}
+    if (seen && seen.key === key) {
+      const el = active();
+      return { seen: true, effect: el && 'value' in el ? 'the focused field now reads ' + JSON.stringify(String(el.value).slice(0, 40)) : null };
+    }
+    return { seen: false };
+  }
+
+  const el = active() || document.body;
+  const editable = el && (('value' in el && !el.disabled && !el.readOnly) || el.isContentEditable);
+  const before = editable && 'value' in el ? String(el.value) : null;
+  const init = {
+    key, code, bubbles: true, cancelable: true, composed: true,
+    ctrlKey: !!(modifiers & 2), altKey: !!(modifiers & 1), shiftKey: !!(modifiers & 8), metaKey: !!(modifiers & 4),
+    keyCode: vk || (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0),
+    which: vk || (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0),
+  };
+  const down = new KeyboardEvent('keydown', init);
+  const notCancelled = el.dispatchEvent(down);
+  let effect = null;
+
+  // Only the behaviours a browser performs itself, and only when the page did
+  // not cancel the key — a handler calling preventDefault means it has taken
+  // charge of this key and doing the default as well would fire it twice.
+  if (notCancelled) {
+    if (key.length === 1 && editable && 'value' in el) {
+      const start = el.selectionStart ?? el.value.length, end = el.selectionEnd ?? el.value.length;
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      const next = el.value.slice(0, start) + key + el.value.slice(end);
+      setter ? setter.call(el, next) : (el.value = next);
+      try { el.setSelectionRange(start + 1, start + 1); } catch (e) {}
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, data: key, inputType: 'insertText' }));
+    } else if (key === 'Backspace' && editable && 'value' in el) {
+      const start = el.selectionStart ?? el.value.length, end = el.selectionEnd ?? el.value.length;
+      const from = start === end ? Math.max(0, start - 1) : start;
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      const next = el.value.slice(0, from) + el.value.slice(end);
+      setter ? setter.call(el, next) : (el.value = next);
+      try { el.setSelectionRange(from, from); } catch (e) {}
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+    } else if (key === 'Enter') {
+      const form = el.form || (el.closest && el.closest('form'));
+      if (form && el.tagName !== 'TEXTAREA') {
+        try { form.requestSubmit ? form.requestSubmit() : form.submit(); effect = 'submitted the form'; } catch (e) {}
+      }
+    } else if (key === 'Tab') {
+      const focusables = [...document.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')]
+        .filter(n => n.offsetWidth || n.offsetHeight);
+      const i = focusables.indexOf(el);
+      const next = focusables[i + (init.shiftKey ? -1 : 1)];
+      if (next) { next.focus(); effect = 'moved focus to ' + next.tagName.toLowerCase() + (next.name ? '[name=' + next.name + ']' : ''); }
+    }
+  }
+  el.dispatchEvent(new KeyboardEvent('keyup', init));
+
+  if (!effect && before !== null && 'value' in el && String(el.value) !== before) {
+    effect = 'the focused field now reads ' + JSON.stringify(String(el.value).slice(0, 40));
+  }
+  return { dispatched: true, cancelled: !notCancelled, effect, target: el.tagName ? el.tagName.toLowerCase() : null };
+}
 
 // Injected. Answers one question: if a click were sent to this point, would it
 // reach the element that was asked for, or something sitting over it?
