@@ -1948,7 +1948,7 @@ async function setDatePicker(tabId, selector, iso) {
   const targetDay = parseInt(dStr, 10);
 
   const inputEl = await resolveElement(tabId, selector);
-  if (!inputEl) return { ok: false, error: 'input-not-found' };
+  if (!inputEl) return { ok: false, error: `No element matches ${JSON.stringify(selector)} on this page. browser_read_page lists what is actually there.` };
   await debuggerClick(tabId, inputEl.x, inputEl.y);
 
   let opened = false;
@@ -2395,7 +2395,7 @@ async function setCombobox(tabId, selector, values, opts = {}) {
     try {
       const inputEl = await resolveElement(tabId, selector);
       if (!inputEl) {
-        results.push({ value: val, ok: false, error: 'input-not-found' });
+        results.push({ value: val, ok: false, error: `No element matches ${JSON.stringify(selector)} on this page. browser_read_page lists what is actually there.` });
         continue;
       }
       await debuggerClick(tabId, inputEl.x, inputEl.y);
@@ -4059,7 +4059,9 @@ async function dispatchCore(port, method, params) {
       return {
         found: false,
         waited_ms: Date.now() - start,
-        ...(sawHidden ? { note: 'Element EXISTS but stayed hidden for the whole timeout. Pass visible:false to match presence only.' } : {}),
+        ...(sawHidden
+          ? { note: 'Element EXISTS but stayed hidden for the whole timeout. Pass visible:false to match presence only.' }
+          : { error: `Nothing matched ${JSON.stringify(sel)} within ${timeout}ms. Either it never appeared, or the selector does not describe it — browser_read_page lists what is on the page, and browser_find takes a description rather than a selector.` }),
       };
     }
 
@@ -7040,7 +7042,7 @@ async function dispatchCore(port, method, params) {
         const a = actions[i] || {};
         const m = String(a.name || a.method || '').replace(/^browser_/, '');
         const p = a.params || a.input || {};
-        if (!m) { results.push({ index: i, ok: false, error: 'missing action name' }); break; }
+        if (!m) { results.push({ index: i, ok: false, error: 'This action has no name. Each item is {name, params}, where name is a tool name such as "click" or "fill".' }); break; }
         if (m === 'batch') { results.push({ index: i, ok: false, error: 'batch cannot be nested' }); break; }
         if (m === 'ask_user' || m === 'solve_captcha') { results.push({ index: i, ok: false, error: m + ' not allowed inside batch (needs interactive timeout) — call it standalone' }); break; }
         try {
