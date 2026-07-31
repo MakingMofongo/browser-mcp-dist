@@ -134,6 +134,29 @@
     }, true);
   }
 
+  // Real input arriving at a tab a run is working in. Someone clicking into the
+  // page at 2am to see how it is going lands a keystroke in the row being filled,
+  // and the run has no idea it did not do that itself.
+  //
+  // isTrusted cannot tell us apart from a person: input dispatched through the
+  // debugger is trusted too. So everything trusted is recorded with its time, and
+  // whoever asks decides — a run knows when its own steps were executing, and
+  // anything landing outside those moments was not it.
+  if (!window.__bmcpUserInput) {
+    const seen = [];
+    window.__bmcpUserInput = seen;
+    const note = (e) => {
+      try {
+        if (!e.isTrusted) return;
+        seen.push({ t: Date.now(), type: e.type });
+        if (seen.length > 60) seen.splice(0, seen.length - 60);
+      } catch (err) {}
+    };
+    for (const type of ['pointerdown', 'keydown', 'wheel']) {
+      document.addEventListener(type, note, true);
+    }
+  }
+
   if (window.__mcpConsoleLogs) return; // already installed (SPA soft-nav, double-inject)
   const MAX = 500;
   const logs = [];

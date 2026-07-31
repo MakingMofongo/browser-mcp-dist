@@ -5151,6 +5151,10 @@ async function dispatchCore(port, method, params) {
         const classify = (d) => {
           if (!d) return null;
           if (d.reason === 'auth-wall') return 'auth';
+          // Someone was using the tab. The flow is fine and the row is not spent,
+          // so it parks the same way a sign-in wall does rather than counting
+          // casualties — the run needs a person to stop touching it, not a fix.
+          if (d.reason === 'interference') return 'auth';
           // The step worked, and did something the clean run never did. Treated as
           // structural because the rest of the queue would do the same thing, and
           // because an unexplained request is the one case worth stopping a whole
@@ -5171,7 +5175,7 @@ async function dispatchCore(port, method, params) {
           .length;
 
         await persist();
-        let stopped = null, authWall = null;
+        let stopped = null, authWall = null, pausedForInterference = false;
         for (const entry of ledger.rows) {
           // submitted_unconfirmed is deliberately not retried. The flow ran to the
           // end, so the likeliest thing is that it worked and the page simply said
@@ -5336,9 +5340,13 @@ async function dispatchCore(port, method, params) {
             entry.status = entry.possibly_committed ? 'needs_review' : 'pending';
             delete entry.kind;
             await persist();
-            authWall = r.diverged_at?.evidence || 'a sign-in or verification page';
-            entry.paused_for = 'authentication';
+            const wasInterference = r.diverged_at?.reason === 'interference';
+            authWall = wasInterference
+              ? (r.diverged_at.detail || 'someone using the tab while the run was in it')
+              : (r.diverged_at?.evidence || 'a sign-in or verification page');
+            entry.paused_for = wasInterference ? 'someone using the browser' : 'authentication';
             entry.auth_evidence = authWall;
+            pausedForInterference = wasInterference;
             stopped = entry;
             break;
           }
@@ -5374,11 +5382,15 @@ async function dispatchCore(port, method, params) {
           failures: failures.length ? failures : undefined,
           ...(stopped && authWall ? {
             paused_at_row: stopped.index,
-            paused_for: 'authentication',
+            paused_for: pausedForInterference ? 'someone using the browser' : 'authentication',
             detected: authWall,
-            reason: 'the site asked for authentication part way through the run',
+            reason: pausedForInterference
+              ? 'input arrived in the tab from outside the run, so the page is no longer in the state the run believes it is'
+              : 'the site asked for authentication part way through the run',
             remaining: (counts.pending || 0),
-            hint: `Sign in once in the browser, then continue with browser_replay({name:"${params.name}", resume:"${runId}"}). The queue is intact and this row was left ready to run rather than counted as failed. Nothing about the flow is wrong, so it does not need re-recording. Tell the user now: an unattended run cannot get past this on its own.`,
+            hint: pausedForInterference
+              ? `Leave the run's tab alone, then continue with browser_replay({name:"${params.name}", resume:"${runId}"}). The queue is intact and this row was left ready to run rather than counted as failed. Nothing about the flow is wrong. Carrying on regardless is the danger — every step after this would act on a page somebody else has changed.`
+              : `Sign in once in the browser, then continue with browser_replay({name:"${params.name}", resume:"${runId}"}). The queue is intact and this row was left ready to run rather than counted as failed. Nothing about the flow is wrong, so it does not need re-recording. Tell the user now: an unattended run cannot get past this on its own.`,
           } : {}),
           ...(stopped && !authWall ? {
             paused_at_row: stopped.index,
@@ -5395,6 +5407,10 @@ async function dispatchCore(port, method, params) {
       const row = params.row || null;
       const results = [];
       let diverged = null;
+      // When this run was itself acting, so trusted input landing at any other
+      // moment can be attributed to a person rather than to us.
+      const actedWindows = [];
+      let interference = null;
 
       if (params.start_url !== false && flow.start_url) {
         await dispatchCore(port, 'navigate', { url: flow.start_url }).catch(() => {});
@@ -5586,8 +5602,33 @@ async function dispatchCore(port, method, params) {
         // to compare and would quietly never fire.
         // The same path a caller's action takes, so a check added to one is a
         // check added to both.
+        const stepFrom = Date.now();
         try { out = await runAction(port, step.method, p, { core: true }); }
         catch (e) { out = { ok: false, error: e?.message || String(e) }; }
+        // Padded at both ends: the page's own handlers fire a little after the
+        // input that caused them, and a step's effects are still this step's.
+        actedWindows.push([stepFrom - 200, Date.now() + 600]);
+
+        // Asked after every step rather than once at the end. What the page
+        // recorded is lost when it navigates, and most flows navigate part way
+        // through — checking only at the end would miss anything that happened
+        // before the last page change, which is most of the run.
+        if (!interference) {
+          try {
+            const t2 = await getSessionTab(port);
+            const [ui] = await chrome.scripting.executeScript({
+              target: { tabId: t2.id }, world: 'MAIN', args: [actedWindows],
+              func: (windows) => {
+                const seen = window.__bmcpUserInput || [];
+                const mine = (t) => windows.some(([a, b]) => t >= a && t <= b);
+                const theirs = seen.filter(e => !mine(e.t));
+                seen.length = 0; // consumed, so a later step is not told twice
+                return theirs.slice(0, 5).map(e => e.type);
+              },
+            });
+            if (ui?.result?.length) interference = [...new Set(ui.result)];
+          } catch { /* advisory */ }
+        }
         results.push({ step: i, method: step.method, ok: out?.ok !== false, value: p.value });
 
         // Escalate on divergence rather than ploughing on into a wrong page.
@@ -5627,6 +5668,19 @@ async function dispatchCore(port, method, params) {
       }
 
       const tab = await getSessionTab(port).catch(() => null);
+
+      // Somebody typed or clicked in this tab while the run was working in it.
+      // Nothing here is wrong with the flow, and continuing is the problem: the
+      // page is no longer in the state the run believes it is, and every step
+      // after this acts on that assumption. Reported so the reason is on record,
+      // because "row 143 went strange" is unanswerable a day later.
+      if (!diverged && interference) {
+        diverged = {
+          reason: 'interference',
+          input: interference,
+          detail: `input arrived in this tab while the run was using it (${interference.join(', ')}), at a moment when the run was not acting`,
+        };
+      }
 
       // With nothing submitted, the useful answer is whether it WOULD have been
       // accepted — so read the validation state the form is now showing.
