@@ -5256,6 +5256,23 @@ async function dispatchCore(port, method, params) {
       if (!from) return { ok: false, error: 'from_selector not found or from_x/from_y missing' };
       if (!to) return { ok: false, error: 'to_selector not found or to_x/to_y missing' };
       const steps = Math.max(2, Math.min(40, params.steps || 12));
+      // A drag either moves something or it does not, and the mouse events
+      // dispatch identically either way. Note where things stand first.
+      const snapshot = async () => {
+        const r = await safeExecuteScript(tab.id, (fx, fy) => {
+          const el = document.elementFromPoint(fx, fy);
+          if (!el) return null;
+          const p = el.parentElement;
+          const b = el.getBoundingClientRect();
+          return {
+            index: p ? [...p.children].indexOf(el) : -1,
+            rect: [Math.round(b.x), Math.round(b.y)],
+            siblings: p ? [...p.children].map(c => (c.textContent || '').trim().slice(0, 20)).join('|') : '',
+          };
+        }, [from.x, from.y]);
+        return r?.result || null;
+      };
+      const before = await snapshot();
       try {
         await debuggerAttach(tab.id);
         await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y });
@@ -5270,7 +5287,17 @@ async function dispatchCore(port, method, params) {
           await new Promise(r => setTimeout(r, 16));
         }
         await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 });
-        return { ok: true, method: 'trusted-mouse', from: { x: from.x, y: from.y }, to: { x: to.x, y: to.y } };
+        await new Promise(r => setTimeout(r, 250));
+        const after = await snapshot();
+        const changed = !before || !after || before.siblings !== after.siblings ||
+          before.index !== after.index || before.rect[0] !== after.rect[0] || before.rect[1] !== after.rect[1];
+        if (!changed) {
+          return {
+            ok: false, method: 'trusted-mouse', from: { x: from.x, y: from.y }, to: { x: to.x, y: to.y },
+            error: 'The drag was performed but nothing moved. Sortable widgets often need a longer press before the move, or more intermediate steps — try a higher steps value, or check the target accepts a drop.',
+          };
+        }
+        return { ok: true, method: 'trusted-mouse', from: { x: from.x, y: from.y }, to: { x: to.x, y: to.y }, verified: !!(before && after) };
       } catch (e) {
         // HTML5 DnD fallback (sortable lists, upload dropzones)
         const [r] = await chrome.scripting.executeScript({
