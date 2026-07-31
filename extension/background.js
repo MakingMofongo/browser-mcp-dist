@@ -2470,7 +2470,17 @@ async function dropFileOnTarget(tabId, selector, files) {
           nodeId: queryResult.nodeId,
           files: fileList,
         });
-        result = { ok: true, method: 'hidden-input', files: fileList, accept: inputInfo.accept };
+        // Same caution as upload_file: handed over is not the same as kept.
+        await new Promise(r => setTimeout(r, 350));
+        const kept = await debuggerEval(tabId, `
+          (function() {
+            const el = document.querySelector(${JSON.stringify(taggedSel)});
+            return el ? Array.from(el.files || []).map(f => f.name) : null;
+          })()
+        `);
+        result = kept && kept.length
+          ? { ok: true, method: 'hidden-input', files: kept, accept: inputInfo.accept, verified: true }
+          : { ok: false, method: 'hidden-input', error: 'The files were set on the input but it is empty again — the page rejected them.', files_attempted: fileList };
       }
     } catch (e) {
       caughtError = e?.message || String(e);
@@ -3671,7 +3681,30 @@ async function dispatchCore(port, method, params) {
       const scope = params.scope || 'non_critical';
       const maxPasses = params.max_passes ?? 3;
       const r = await dismissOverlays(tab.id, scope, maxPasses);
-      return { ok: true, dismissed: r.dismissed, skipped: r.skipped, count: r.dismissed.length };
+      // A close button that does not throw is not the same as an overlay that
+      // went away — React modals that want pointerdown swallow a plain click
+      // silently. What is on the page afterwards is the answer.
+      const left = await safeExecuteScript(tab.id, () => {
+        const blocking = [];
+        for (const el of document.querySelectorAll('[role="dialog"], [role="alertdialog"], .modal, .overlay, [class*="consent" i], [class*="cookie" i]')) {
+          const cs = getComputedStyle(el);
+          const b = el.getBoundingClientRect();
+          if (cs.display === 'none' || cs.visibility === 'hidden' || +cs.opacity === 0) continue;
+          if (b.width < 40 || b.height < 40) continue;
+          const label = (el.getAttribute('aria-label') || (el.innerText || '').replace(/\s+/g, ' ').trim()).slice(0, 60);
+          blocking.push({ tag: el.tagName.toLowerCase(), label, covers_viewport: b.width * b.height > innerWidth * innerHeight * 0.25 });
+        }
+        return blocking.slice(0, 5);
+      });
+      const remaining = left?.result || [];
+      return {
+        ok: true,
+        dismissed: r.dismissed, skipped: r.skipped, count: r.dismissed.length,
+        ...(remaining.length ? {
+          still_present: remaining,
+          note: 'These were not closed. A widget that ignores a plain click usually wants a real press — try browser_click on its close control, or press Escape.',
+        } : {}),
+      };
     }
 
     case 'set_combobox': {
@@ -3803,47 +3836,106 @@ async function dispatchCore(port, method, params) {
       if (params.selector) {
         const el = await resolveElement(tab.id, params.selector);
         if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
-        return { ok: true, scrolled_to: params.selector };
+        // scrollIntoView is best-effort: inside a scroll container with its own
+        // overflow, or under a sticky header, the element can end up off screen
+        // or covered. Report where it actually is.
+        const where = await safeExecuteScript(tab.id, (sel) => {
+          const deep = (root) => {
+            let e = null;
+            try { e = root.querySelector(sel); } catch { return null; }
+            if (e) return e;
+            for (const n of root.querySelectorAll('*')) if (n.shadowRoot) { const f = deep(n.shadowRoot); if (f) return f; }
+            return null;
+          };
+          const e = deep(document);
+          if (!e) return null;
+          const b = e.getBoundingClientRect();
+          return { top: Math.round(b.top), in_view: b.top >= 0 && b.bottom <= window.innerHeight && b.left >= 0 && b.right <= window.innerWidth, y: window.scrollY };
+        }, [params.selector]);
+        const w = where?.result;
+        if (w && !w.in_view) {
+          return { ok: false, scrolled_to: params.selector, position: w.y, element_top: w.top,
+                   error: 'Scrolled, but the element is still not fully in view — it is probably inside its own scrolling container or behind a fixed header.' };
+        }
+        return { ok: true, scrolled_to: params.selector, position: w?.y, verified: !!w };
       }
-      // Scroll by pixels using CDP mouseWheel — split into smaller steps so IntersectionObservers fire.
-      // FB/Twitter/IG only trigger lazy-load on continuous wheel events, not a single large delta.
       const dx = params.x || 0;
       const dy = params.y || 0;
-      // Scripting fallback first-class: scrolling must not hard-fail just because
-      // the debugger is unavailable — window.scrollBy works on almost every page.
-      const scrollViaScripting = async () => {
+
+      const readPos = async () => {
+        try {
+          const [r] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, world: 'MAIN',
+            func: () => ({ y: window.scrollY, x: window.scrollX, max: document.documentElement.scrollHeight - window.innerHeight }),
+          });
+          return r?.result || null;
+        } catch { return null; }
+      };
+
+      const startedAt = await readPos();
+
+      // Stepped rather than one jump, so IntersectionObservers and lazy-load
+      // handlers get the same sequence of positions a person scrolling produces.
+      const stepped = async () => {
         const [r] = await chrome.scripting.executeScript({
           target: { tabId: tab.id }, world: 'MAIN', args: [dx, dy],
-          func: (x, y) => {
+          func: async (x, y) => {
             const before = window.scrollY;
-            window.scrollBy({ left: x, top: y, behavior: 'instant' });
-            return { scrolled: window.scrollY - before, at: window.scrollY, max: document.documentElement.scrollHeight };
+            const steps = Math.max(1, Math.min(20, Math.ceil(Math.max(Math.abs(x), Math.abs(y)) / 300)));
+            for (let i = 0; i < steps; i++) {
+              window.scrollBy({ left: x / steps, top: y / steps, behavior: 'instant' });
+              if (i < steps - 1) await new Promise(r2 => setTimeout(r2, 60));
+            }
+            await new Promise(r2 => setTimeout(r2, 250));
+            return { moved: window.scrollY - before, at: window.scrollY };
           },
         });
         return r?.result;
       };
+
+      // A wheel event is the only thing some virtualised lists listen for, but
+      // Chrome does not acknowledge one dispatched at a tab that is not in front,
+      // and the command then never returns. It is worth trying and never worth
+      // waiting on, so it runs under a deadline and the reliable path follows.
+      let usedWheel = false;
       try {
         await debuggerAttach(tab.id);
-        const STEP_SIZE = 300; // pixels per wheel-event (matches a typical mouse-wheel notch)
-        const totalSteps = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / STEP_SIZE));
-        const stepX = dx / totalSteps;
-        const stepY = dy / totalSteps;
-        for (let i = 0; i < totalSteps; i++) {
-          await cdpSend(tab.id, 'Input.dispatchMouseEvent', {
-            type: 'mouseWheel', x: 400, y: 300, deltaX: stepX, deltaY: stepY,
-          });
-          // Small delay between wheel-events so IntersectionObserver + lazy-load XHRs can fire
-          if (i < totalSteps - 1) await new Promise(r => setTimeout(r, 80));
-        }
-        // After last wheel-event, give FB/Twitter/IG ~600ms to start lazy-load XHRs
-        // before any subsequent commands run (caller often scrapes immediately after)
-        await new Promise(r => setTimeout(r, 600));
-      } catch (e) {
-        const r = await scrollViaScripting().catch(() => null);
-        if (r) return { ok: true, scrolled: { x: dx, y: dy }, position: r.at, method: 'scripting-fallback', fallback_reason: e.message };
-        return { ok: false, error: 'Scroll failed on both the debugger and scripting paths: ' + (e?.message || e) };
+        const steps = Math.max(1, Math.min(20, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 300)));
+        await Promise.race([
+          (async () => {
+            for (let i = 0; i < steps; i++) {
+              await cdpSend(tab.id, 'Input.dispatchMouseEvent', {
+                type: 'mouseWheel', x: 400, y: 300, deltaX: dx / steps, deltaY: dy / steps,
+              });
+              if (i < steps - 1) await new Promise(r => setTimeout(r, 60));
+            }
+            usedWheel = true;
+          })(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('wheel-timeout')), 2500)),
+        ]);
+        await new Promise(r => setTimeout(r, 300));
+      } catch { /* falls through to the scripting path below */ }
+
+      let after = await readPos();
+      let moved = startedAt && after ? after.y - startedAt.y : null;
+
+      if (!usedWheel || moved === 0) {
+        const r = await stepped().catch(() => null);
+        if (r) { after = { y: r.at, max: after?.max ?? 0 }; moved = startedAt ? r.at - startedAt.y : r.moved; }
       }
-      return { ok: true, scrolled: { x: dx, y: dy }, method: 'mouseWheel-stepped' };
+
+      if (moved === null) return { ok: false, error: 'Scrolled, but the position could not be read back, so there is nothing to confirm.' };
+      if (moved === 0 && dy !== 0) {
+        const atEnd = after.max > 0 && after.y >= after.max - 2;
+        return {
+          ok: false, position: after.y, moved: 0,
+          error: atEnd
+            ? (dy > 0 ? 'Already at the bottom of the page.' : 'Already at the top of the page.')
+            : 'The page did not move. The scrollable part is probably an inner element — pass a selector instead of a pixel amount.',
+        };
+      }
+      return { ok: true, moved, position: after.y, at_bottom: after.max > 0 && after.y >= after.max - 2,
+               method: usedWheel ? 'wheel' : 'stepped', verified: true };
     }
 
     // ── v1.26 "superior" tools ──────────────────────────────────────────────
@@ -5263,20 +5355,52 @@ async function dispatchCore(port, method, params) {
       `);
 
       if (isNativeSelect) {
-        // Native <select> — set value directly
-        await debuggerEval(tab.id, `
+        // Native <select>. Matching is tried exactly first: "India" must not pick
+        // "British Indian Ocean Territory" just because the text contains it,
+        // which is how a country field ends up quietly wrong.
+        const res = await debuggerEval(tab.id, `
           (function() {
             const sel = document.querySelector(${JSON.stringify(params.selector)});
-            const opt = Array.from(sel.options).find(o => o.text.includes(${JSON.stringify(params.option)}) || o.value === ${JSON.stringify(params.option)});
-            if (opt) {
-              sel.value = opt.value;
-              sel.dispatchEvent(new Event('change', { bubbles: true }));
-              sel.dispatchEvent(new Event('input', { bubbles: true }));
+            if (!sel) return { found: false, error: 'gone' };
+            const want = ${JSON.stringify(params.option)};
+            const txt = (o) => (o.text || '').trim();
+            const opts = Array.from(sel.options);
+            const opt = opts.find(o => txt(o) === want || o.value === want)
+                     || opts.find(o => txt(o).toLowerCase() === want.toLowerCase())
+                     || opts.filter(o => txt(o).toLowerCase().includes(want.toLowerCase()));
+            const chosen = Array.isArray(opt) ? (opt.length === 1 ? opt[0] : null) : opt;
+            if (!chosen) {
+              return {
+                found: false,
+                ambiguous: Array.isArray(opt) && opt.length > 1 ? opt.map(txt).slice(0, 8) : null,
+                available: opts.map(txt).slice(0, 40),
+                total: opts.length,
+              };
             }
-            return !!opt;
+            sel.value = chosen.value;
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
+            sel.dispatchEvent(new Event('input', { bubbles: true }));
+            // Read back from the element itself: a framework can reject or rewrite
+            // the assignment, and then the field is not what was asked for.
+            const now = sel.options[sel.selectedIndex];
+            return { found: true, wanted: txt(chosen), now: now ? txt(now) : null, value: sel.value };
           })()
         `);
-        return { ok: true, type: 'native_select' };
+        if (!res?.found) {
+          if (res?.ambiguous) {
+            return { ok: false, error: `"${params.option}" matches several options — ${res.ambiguous.join(', ')}. Use the exact text.`, options: res.ambiguous };
+          }
+          return {
+            ok: false,
+            error: `No option matching "${params.option}" in ${params.selector}. Nothing was selected.`,
+            available_options: res?.available,
+            ...(res?.total > 40 ? { note: `showing 40 of ${res.total}` } : {}),
+          };
+        }
+        if (res.now !== res.wanted) {
+          return { ok: false, error: `The select did not keep "${res.wanted}" — it now shows "${res.now}". The page rejected or rewrote the change.`, current: res.now };
+        }
+        return { ok: true, type: 'native_select', selected: res.now, value: res.value, verified: true };
       }
 
       // Custom dropdown (Angular Material, React Select, etc.)
@@ -5293,7 +5417,30 @@ async function dispatchCore(port, method, params) {
       if (!option) return { ok: false, error: 'Option not found: ' + params.option };
       await debuggerClick(tab.id, option.x, option.y);
 
-      return { ok: true, type: 'custom_dropdown', selected: params.option };
+      // These widgets often need mousedown rather than click, and swallow the
+      // click silently when they do, so what the control shows afterwards is the
+      // only trustworthy answer.
+      await new Promise(r => setTimeout(r, 200));
+      const after = await debuggerEval(tab.id, `
+        (function() {
+          const el = document.querySelector(${JSON.stringify(params.selector)});
+          if (!el) return null;
+          const shown = (el.value || el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+          const sel = el.querySelector && el.querySelector('[aria-selected="true"], .selected, [data-selected="true"]');
+          return { shown, selected: sel ? (sel.innerText || sel.textContent || '').trim().slice(0, 120) : null,
+                   expanded: el.getAttribute && el.getAttribute('aria-expanded') };
+        })()
+      `);
+      const shows = `${after?.shown || ''} ${after?.selected || ''}`.toLowerCase();
+      const took = !after || shows.includes(String(params.option).toLowerCase());
+      if (!took) {
+        return {
+          ok: false, type: 'custom_dropdown',
+          error: `The option was clicked but "${params.option}" is not what the control shows — it reads "${after.shown}". Some widgets need mousedown rather than a click; open it with browser_click and pick with browser_set_combobox.`,
+          shows: after.shown, still_open: after.expanded === 'true',
+        };
+      }
+      return { ok: true, type: 'custom_dropdown', selected: params.option, shows: after?.shown, verified: !!after };
     }
 
     case 'handle_dialog': {
@@ -5498,12 +5645,24 @@ async function dispatchCore(port, method, params) {
             httpOnly: c.httpOnly || false,
             sameSite: c.sameSite || 'lax',
           });
-          results.push({ ok: true, name: c.name });
+          // chrome.cookies.set resolves with null instead of throwing when the
+          // cookie was refused — a secure cookie on an http URL, or a domain that
+          // does not match the URL. Taking "no exception" as success is how a
+          // restored session silently is not restored.
+          if (!cookie) {
+            results.push({
+              ok: false, name: c.name,
+              error: 'Chrome refused this cookie. Usually the domain does not match the URL, or a secure cookie was set on an http:// address.',
+            });
+          } else {
+            results.push({ ok: true, name: cookie.name, domain: cookie.domain, expires: cookie.expirationDate || null });
+          }
         } catch (e) {
           results.push({ ok: false, name: c.name, error: e.message });
         }
       }
-      return { results };
+      const failed = results.filter(r => !r.ok);
+      return { results, set: results.length - failed.length, failed: failed.length, ok: failed.length === 0 };
     }
 
     case 'set_local_storage': {
@@ -5512,12 +5671,22 @@ async function dispatchCore(port, method, params) {
       const key = params.key;
       const val = params.value;
       const expr = `localStorage.setItem(${JSON.stringify(key)}, ${JSON.stringify(val)})`;
+      // Written and read back in the same call: storage can be partitioned,
+      // full, or restricted, and setItem does not always raise when it declines.
       try {
-        const scriptResult = await safeExecuteScript(tab.id, (k, v) => { localStorage.setItem(k, v); return { ok: true }; }, [key, val]);
+        const scriptResult = await safeExecuteScript(tab.id, (k, v) => {
+          try { localStorage.setItem(k, v); } catch (e) { return { ok: false, error: e.message }; }
+          const back = localStorage.getItem(k);
+          return back === v ? { ok: true, verified: true }
+                            : { ok: false, error: 'the value did not persist — localStorage now holds ' + (back === null ? 'nothing' : JSON.stringify(String(back).slice(0, 80))) };
+        }, [key, val]);
         if (!scriptResult.cspBlocked) return scriptResult.result;
       } catch {}
       await debuggerEval(tab.id, expr);
-      return { ok: true, method: 'debugger' };
+      const back = await debuggerEval(tab.id, `localStorage.getItem(${JSON.stringify(key)})`);
+      return back === val
+        ? { ok: true, method: 'debugger', verified: true }
+        : { ok: false, method: 'debugger', error: 'the value did not persist in localStorage' };
     }
 
     case 'console_logs': {
@@ -5770,8 +5939,37 @@ async function dispatchCore(port, method, params) {
           files: files,
         });
 
+        // Portals commonly validate on change and clear the input again. The CDP
+        // call succeeding says the file was handed over, not that it was kept,
+        // and an application submitted with an empty attachment looks fine here
+        // and wrong at the other end. Settle first, then read the input.
+        await new Promise(r => setTimeout(r, 350));
+        const check = await debuggerEval(tab.id, `
+          (function() {
+            const el = document.querySelector(${JSON.stringify(selector)});
+            if (!el) return { gone: true };
+            const names = Array.from(el.files || []).map(f => f.name);
+            const err = (function() {
+              const box = el.closest('form, div, section') || document.body;
+              const t = (box.innerText || '').replace(/\\s+/g, ' ');
+              const m = t.match(/[^.]*\\b(invalid|not allowed|too large|exceeds|unsupported|must be)\\b[^.]*/i);
+              return m ? m[0].trim().slice(0, 160) : null;
+            })();
+            return { names, count: names.length, error_text: err };
+          })()
+        `);
         await debuggerDetach(tab.id);
-        return { ok: true, files: files, input: info };
+        if (check?.gone) return { ok: false, error: 'The file input disappeared after the files were set, so nothing can be confirmed.' };
+        if (!check?.count) {
+          return {
+            ok: false,
+            error: 'The files were handed to the input but it is empty again — the page rejected them.',
+            ...(check?.error_text ? { page_says: check.error_text } : {}),
+            files_attempted: files,
+          };
+        }
+        return { ok: true, files: check.names, count: check.count, input: info, verified: true,
+                 ...(check.error_text ? { page_says: check.error_text } : {}) };
       } catch (e) {
         try { await debuggerDetach(tab.id); } catch {}
         return { ok: false, error: e.message };
