@@ -3125,17 +3125,72 @@ chrome.webNavigation?.onCommitted?.addListener((d) => {
   if (d.frameId === 0) writtenValues.delete(d.tabId);
 });
 
+// A short history of what the tools have actually been doing. Every defect worth
+// finding here hid the same way: nothing was watching in the moment. Clicks spent
+// five seconds each for months, several tools did nothing at all, and tools drop
+// to a fallback path silently by design — none of which is visible from a single
+// result. Kept small and bounded, and holds no page content: a method name, how
+// long it took, whether it worked, and which path it took.
+const callLog = [];
+const CALL_LOG_MAX = 250;
+
+function noteCall(method, ms, result) {
+  const r = result && typeof result === 'object' ? result : {};
+  callLog.push({
+    method, ms,
+    ok: r.ok !== false && r.found !== false,
+    // Which route the action ended up using, when it reports one — a run quietly
+    // living on fallbacks still works, and is worth knowing about before it stops.
+    path: r.path || r.click_path || r.method || null,
+    verified: r.verified === true ? true : (r.verified === false ? false : null),
+  });
+  if (callLog.length > CALL_LOG_MAX) callLog.splice(0, callLog.length - CALL_LOG_MAX);
+}
+
 async function dispatch(port, method, params) {
+  const started = Date.now();
   const rec = recording.get(port);
+  let result;
   if (rec && RECORDABLE.has(method)) {
-    const result = await dispatchInner(port, method, params);
+    result = await dispatchInner(port, method, params);
     await recordStep(port, method, params, result).catch(() => {});
-    await trackWrite(port, method, params, result);
-    return result;
+  } else {
+    result = await dispatchInner(port, method, params);
   }
-  const result = await dispatchInner(port, method, params);
+  noteCall(method, Date.now() - started, result);
   await trackWrite(port, method, params, result);
   return result;
+}
+
+// Summarised rather than dumped: 250 rows of history in every health call would
+// cost more attention than it repays. What matters is which calls are slow, which
+// are failing, and which are quietly running on a fallback.
+function callLogSummary() {
+  if (!callLog.length) return null;
+  const by = new Map();
+  for (const c of callLog) {
+    let e = by.get(c.method);
+    if (!e) { e = { calls: 0, total: 0, slowest: 0, failed: 0, fallbacks: 0, unverified: 0 }; by.set(c.method, e); }
+    e.calls++; e.total += c.ms;
+    if (c.ms > e.slowest) e.slowest = c.ms;
+    if (!c.ok) e.failed++;
+    if (c.path && /fallback|synthetic|stepped|legacy|html5/i.test(c.path)) e.fallbacks++;
+    if (c.ok && c.verified === false) e.unverified++;
+  }
+  const rows = [...by.entries()].map(([method, e]) => ({
+    method, calls: e.calls, mean_ms: Math.round(e.total / e.calls), slowest_ms: e.slowest,
+    ...(e.failed ? { failed: e.failed } : {}),
+    ...(e.fallbacks ? { used_fallback: e.fallbacks } : {}),
+    ...(e.unverified ? { succeeded_unverified: e.unverified } : {}),
+  })).sort((a, b) => b.mean_ms - a.mean_ms);
+  const slow = rows.filter(r => r.mean_ms >= 1500);
+  const fell = rows.filter(r => r.used_fallback);
+  return {
+    calls: callLog.length,
+    by_tool: rows.slice(0, 12),
+    ...(slow.length ? { slow: `${slow.map(s => s.method).join(', ')} — averaging over 1.5s, which is a stall rather than a cost and usually means input is not being delivered` } : {}),
+    ...(fell.length ? { note: `${fell.map(s => s.method).join(', ')} completed on a fallback path rather than the primary one` } : {}),
+  };
 }
 
 const WRITES = new Set(['fill', 'fill_legacy', 'set_date', 'select_option', 'set_combobox']);
@@ -6954,8 +7009,16 @@ async function dispatchCore(port, method, params) {
         debugger_attached: debuggerAttachedReal,
         scripting_works: scriptingOk,
         ready: scriptingOk,
+        // Whether real input can be delivered to this window at all. It changes
+        // which path every click and keystroke takes, and it is the difference
+        // between a fast run and one that spends seconds per action, so it is
+        // worth knowing before a long job rather than after.
+        trusted_input: trustedInputLikelyDead((await chrome.tabs.get(tab.id).catch(() => null))?.windowId)
+          ? 'unavailable — the Chrome window is not in front, so clicks and keys are delivered by script instead. Everything works; real input would be used if the window were focused.'
+          : 'available or not yet tested',
         ...(captcha ? { captcha } : {}),
         ...(wall ? { auth_wall: { detected: wall.evidence, url: wall.url } } : {}),
+        ...(callLogSummary() ? { recent: callLogSummary() } : {}),
         hint: captcha ? 'A CAPTCHA is on the page. It cannot be solved from here, and it is there precisely to require a person — tell the user what is blocking the flow, let them clear it in the browser, then continue.' :
               wall ? `The page is asking for authentication (${wall.evidence}). Tell the user, let them sign in, then continue. Automation cannot get past this on its own.` :
               !scriptingOk ? (!tab.url || tab.url.startsWith('about:') || tab.url.startsWith('chrome://')
