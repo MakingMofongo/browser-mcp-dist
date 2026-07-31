@@ -3944,6 +3944,43 @@ async function dispatchCore(port, method, params) {
       const store = await chrome.storage.local.get({ bmcpFlows: {} });
       const flow = store.bmcpFlows[params.name];
       if (!flow) return { ok: false, error: `No flow named ${params.name}. List them with browser_record({action:"list"}).` };
+
+      // Many rows in one call. The point of replay is that iteration 1 and
+      // iteration 200 cost the same, so the caller should not have to spend a
+      // round trip per record.
+      if (Array.isArray(params.rows)) {
+        const rows = params.rows.slice(0, 500);
+        const onError = params.on_error || 'stop';   // stop | continue
+        const done = [], failures = [];
+        for (let n = 0; n < rows.length; n++) {
+          const r = await dispatchCore(port, 'replay', {
+            ...params, rows: undefined, row: rows[n], verbose: false,
+          });
+          if (r.ok) done.push(n);
+          else {
+            failures.push({ row_index: n, row: rows[n], diverged_at: r.diverged_at, url: r.url });
+            if (onError === 'stop') {
+              return {
+                ok: false, flow: params.name,
+                rows_total: rows.length, rows_completed: done.length,
+                stopped_at_row: n,
+                failures,
+                remaining: rows.length - n - 1,
+                hint: 'Stopped so the remaining rows are untouched. Fix or skip this row, then call again with rows sliced from here, or pass on_error:"continue" to work through the rest and collect failures.',
+              };
+            }
+          }
+        }
+        return {
+          ok: failures.length === 0,
+          flow: params.name,
+          rows_total: rows.length,
+          rows_completed: done.length,
+          failures,
+          ...(failures.length ? { hint: `${failures.length} row(s) diverged and were skipped; each entry carries the row data and the step that failed.` } : {}),
+        };
+      }
+
       const row = params.row || null;
       const results = [];
       let diverged = null;
