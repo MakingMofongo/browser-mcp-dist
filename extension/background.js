@@ -1007,6 +1007,9 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
 }
 
 async function fillElementDeep(tabId, selector, value) {
+  if (typeof selector !== 'string' || !selector.trim()) {
+    return { ok: false, error: 'selector is required and must be a string (received ' + (selector === undefined ? 'nothing' : typeof selector) + ')' };
+  }
   const inject = async (args) => {
     const [r] = await chrome.scripting.executeScript({
       target: { tabId }, world: 'MAIN', args, func: bmcpFillOp,
@@ -1313,6 +1316,7 @@ function buildTextFinderJS(textPattern, tagFilter) {
 }
 
 function parseSelector(selector) {
+  if (typeof selector !== 'string') selector = '';
   // "ref_12" / "ref=12" → element handle from browser_read_page / browser_find
   const refMatch = selector.match(/^ref[_=](\d+)$/);
   if (refMatch) return { type: 'ref', ref: 'ref_' + refMatch[1] };
