@@ -4043,39 +4043,127 @@ async function dispatchCore(port, method, params) {
       const flow = store.bmcpFlows[params.name];
       if (!flow) return { ok: false, error: `No flow named ${params.name}. List them with browser_record({action:"list"}).` };
 
-      // Many rows in one call. The point of replay is that iteration 1 and
-      // iteration 200 cost the same, so the caller should not have to spend a
-      // round trip per record.
-      if (Array.isArray(params.rows)) {
-        const rows = params.rows.slice(0, 500);
-        const onError = params.on_error || 'stop';   // stop | continue
-        const done = [], failures = [];
-        for (let n = 0; n < rows.length; n++) {
-          const r = await dispatchCore(port, 'replay', {
-            ...params, rows: undefined, row: rows[n], verbose: false,
-          });
-          if (r.ok) done.push(n);
-          else {
-            failures.push({ row_index: n, row: rows[n], diverged_at: r.diverged_at, url: r.url });
-            if (onError === 'stop') {
-              return {
-                ok: false, flow: params.name,
-                rows_total: rows.length, rows_completed: done.length,
-                stopped_at_row: n,
-                failures,
-                remaining: rows.length - n - 1,
-                hint: 'Stopped so the remaining rows are untouched. Fix or skip this row, then call again with rows sliced from here, or pass on_error:"continue" to work through the rest and collect failures.',
-              };
-            }
+      // Many rows in one call, with a persisted ledger so the run can be answered
+      // for afterwards ("did row 130 go through?") and resumed after a crash.
+      if (Array.isArray(params.rows) || params.resume) {
+        const runsStore = await chrome.storage.local.get({ bmcpRuns: {} });
+        const runs = runsStore.bmcpRuns;
+        let runId, ledger;
+
+        if (params.resume) {
+          ledger = runs[params.resume];
+          if (!ledger) return { ok: false, error: `No run named ${params.resume}. List them with browser_runs.` };
+          runId = params.resume;
+        } else {
+          runId = 'run_' + Date.now().toString(36);
+          ledger = {
+            flow: params.name,
+            started: new Date().toISOString(),
+            rows: params.rows.slice(0, 500).map((row, i) => ({ index: i, row, status: 'pending' })),
+          };
+        }
+
+        const persist = async () => {
+          const s2 = await chrome.storage.local.get({ bmcpRuns: {} });
+          s2.bmcpRuns[runId] = { ...ledger, updated: new Date().toISOString() };
+          // Keep the ledger bounded; oldest runs fall off.
+          const keys = Object.keys(s2.bmcpRuns);
+          if (keys.length > 20) {
+            keys.sort((a, b) => (s2.bmcpRuns[a].started || '').localeCompare(s2.bmcpRuns[b].started || ''));
+            for (const k of keys.slice(0, keys.length - 20)) delete s2.bmcpRuns[k];
+          }
+          await chrome.storage.local.set({ bmcpRuns: s2.bmcpRuns });
+        };
+
+        // Not every divergence means the same thing, and treating them alike either
+        // abandons a run over one bad record or ploughs 150 half-submissions into a
+        // portal whose shape has changed.
+        const classify = (d) => {
+          if (!d) return null;
+          if (d.reason === 'target-not-found') return 'structural';
+          const a = d.actual || {};
+          const blob = JSON.stringify(a);
+          if (a.outcome === 'validation_error' || (a.errors && a.errors.length)) return 'row-level';
+          if (a.outcome === 'no_change' || /timed out|timeout|no matching request/i.test(blob)) return 'transient';
+          return 'structural';
+        };
+
+        const postsSeen = () => (networkLogs.get((getSession(port).activeTabId) || -1) || [])
+          .filter(e => e.method === 'POST' || e.method === 'PUT').length;
+
+        await persist();
+        let stopped = null;
+        for (const entry of ledger.rows) {
+          if (entry.status === 'done' || entry.status === 'skipped') continue;
+          const postsBefore = postsSeen();
+          let r = await dispatchCore(port, 'replay', { ...params, rows: undefined, resume: undefined, row: entry.row, verbose: false });
+          let kind = r.ok ? null : classify(r.diverged_at);
+
+          // A slow spinner or a blip is worth one more attempt; a rejected record
+          // and a changed page are not.
+          if (kind === 'transient') {
+            entry.retried = true;
+            r = await dispatchCore(port, 'replay', { ...params, rows: undefined, resume: undefined, row: entry.row, verbose: false });
+            kind = r.ok ? null : classify(r.diverged_at);
+            if (kind === 'transient') kind = 'row-level';
+          }
+
+          entry.at = new Date().toISOString();
+          if (r.ok) {
+            entry.status = 'done';
+            // Scrape whatever the page calls the receipt, so the run can be audited
+            // later without reopening the portal.
+            try {
+              const tab = await getSessionTab(port);
+              const [c] = await chrome.scripting.executeScript({
+                target: { tabId: tab.id }, world: 'MAIN',
+                func: () => {
+                  const t = (document.body?.innerText || '').replace(/\s+/g, ' ');
+                  const m = t.match(/(confirmation|reference|application|receipt|order)\s*(?:id|number|no\.?|#)?\s*[:#]?\s*([A-Z0-9][A-Z0-9-]{4,20})/i);
+                  return m ? m[0].slice(0, 60) : null;
+                },
+              });
+              if (c?.result) entry.confirmation = c.result;
+            } catch {}
+          } else {
+            entry.status = kind === 'structural' ? 'failed' : 'skipped';
+            entry.kind = kind;
+            entry.diverged_at = r.diverged_at;
+            entry.url = r.url;
+            // Whether anything was committed decides rerun versus duplicate.
+            const steps = r.steps_total || 0;
+            entry.progress = `${r.steps_run || 0}/${steps}`;
+            entry.possibly_committed = postsSeen() > postsBefore;
+          }
+          await persist();
+
+          if (kind === 'structural') {
+            stopped = entry;
+            break;
           }
         }
+
+        const counts = ledger.rows.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {});
+        const failures = ledger.rows.filter(r => r.status === 'skipped' || r.status === 'failed')
+          .map(({ row, index, kind, diverged_at, progress, possibly_committed, url }) =>
+            ({ row_index: index, row, kind, progress, possibly_committed, url, diverged_at }));
+
         return {
-          ok: failures.length === 0,
+          ok: !stopped && !failures.length,
+          run_id: runId,
           flow: params.name,
-          rows_total: rows.length,
-          rows_completed: done.length,
-          failures,
-          ...(failures.length ? { hint: `${failures.length} row(s) diverged and were skipped; each entry carries the row data and the step that failed.` } : {}),
+          rows_total: ledger.rows.length,
+          ...counts,
+          failures: failures.length ? failures : undefined,
+          ...(stopped ? {
+            paused_at_row: stopped.index,
+            reason: 'structural divergence — the page no longer matches the recording, so the remaining rows would fail the same way',
+            remaining: counts.pending || 0,
+            hint: `The queue is kept. Inspect the page, fix the row or re-record the flow, then continue with browser_replay({name:"${params.name}", resume:"${runId}"}). The browser has been left on the failing page.`,
+          } : {}),
+          ...(failures.length && !stopped ? {
+            hint: 'Rows listed in failures were skipped; each carries its data, how far it got, and whether anything may already have been submitted.',
+          } : {}),
         };
       }
 
@@ -4143,6 +4231,30 @@ async function dispatchCore(port, method, params) {
           diverged_at: diverged,
           hint: 'The page no longer matches the recording at this step. Inspect with browser_form_state or browser_read_page, handle this case, then continue or re-record.',
         } : {}),
+      };
+    }
+
+    case 'runs': {
+      const store = await chrome.storage.local.get({ bmcpRuns: {} });
+      const runs = store.bmcpRuns;
+      if (params.id) {
+        const r = runs[params.id];
+        if (!r) return { ok: false, error: `No run named ${params.id}` };
+        const rows = params.status ? r.rows.filter(x => x.status === params.status) : r.rows;
+        return { ok: true, run_id: params.id, flow: r.flow, started: r.started, updated: r.updated, rows };
+      }
+      if (params.delete) {
+        delete runs[params.delete];
+        await chrome.storage.local.set({ bmcpRuns: runs });
+        return { ok: true, deleted: params.delete };
+      }
+      return {
+        ok: true,
+        runs: Object.entries(runs).map(([id, r]) => ({
+          run_id: id, flow: r.flow, started: r.started, updated: r.updated,
+          total: r.rows.length,
+          ...r.rows.reduce((a, x) => { a[x.status] = (a[x.status] || 0) + 1; return a; }, {}),
+        })).sort((a, b) => (b.started || '').localeCompare(a.started || '')),
       };
     }
 
