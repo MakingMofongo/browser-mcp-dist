@@ -2755,8 +2755,35 @@ async function captureAnomalyShot(tabId, selector) {
           if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
           else { try { el = document.querySelector(sel); } catch (e) {} }
           if (!el || !el.isConnected) return null;
-          const b = el.getBoundingClientRect();
-          return { x: b.x, y: b.y, w: b.width, h: b.height, vw: innerWidth, vh: innerHeight };
+          const vis = (n) => {
+            const r = n.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight;
+          };
+          // A crop tight around the control shows a field that looks perfectly fine
+          // while the message explaining the failure sits at the top of the form.
+          // Include the surrounding form and any error text currently on screen.
+          let b = el.getBoundingClientRect();
+          let x1 = b.left, y1 = b.top, x2 = b.right, y2 = b.bottom;
+          const form = el.closest('form, fieldset, [role="form"], section, .form-group, [class*="form" i]');
+          if (form && vis(form)) {
+            const f = form.getBoundingClientRect();
+            // Only adopt the container if it is a form, not the whole page.
+            if (f.height <= innerHeight * 0.9) {
+              x1 = Math.min(x1, f.left); y1 = Math.min(y1, f.top);
+              x2 = Math.max(x2, f.right); y2 = Math.max(y2, f.bottom);
+            }
+          }
+          for (const e of document.querySelectorAll('[role="alert"], [aria-invalid="true"], .error, .invalid-feedback, [class*="error" i]:not(input):not(select):not(textarea):not(form)')) {
+            if (!vis(e)) continue;
+            const r = e.getBoundingClientRect();
+            x1 = Math.min(x1, r.left); y1 = Math.min(y1, r.top);
+            x2 = Math.max(x2, r.right); y2 = Math.max(y2, r.bottom);
+          }
+          return {
+            x: x1, y: y1, w: x2 - x1, h: y2 - y1,
+            el: { x: b.x, y: b.y, w: b.width, h: b.height },
+            vw: innerWidth, vh: innerHeight,
+          };
         },
       });
       rect = r?.result || null;
@@ -2764,17 +2791,17 @@ async function captureAnomalyShot(tabId, selector) {
   }
   try {
     await debuggerAttach(tabId);
-    const PAD = 60;
+    const PAD = 24;
     let clip;
     if (rect && rect.w > 0 && rect.h > 0) {
       const x = Math.max(0, rect.x - PAD);
       const y = Math.max(0, rect.y - PAD);
-      clip = {
-        x, y,
-        width: Math.min(rect.vw - x, rect.w + PAD * 2),
-        height: Math.min(rect.vh - y, rect.h + PAD * 2),
-        scale: 0.6,
-      };
+      const width = Math.min(rect.vw - x, rect.w + PAD * 2);
+      const height = Math.min(rect.vh - y, rect.h + PAD * 2);
+      // Scale down further as the region grows, so a whole-form crop costs about
+      // the same as a tight one.
+      const area = width * height;
+      clip = { x, y, width, height, scale: area > 500000 ? 0.4 : area > 200000 ? 0.5 : 0.6 };
     } else {
       const [vp] = await chrome.scripting.executeScript({
         target: { tabId }, world: 'MAIN', func: () => ({ vw: innerWidth, vh: innerHeight }),
@@ -2790,7 +2817,8 @@ async function captureAnomalyShot(tabId, selector) {
       data: 'data:image/jpeg;base64,' + shot.data,
       region: { x: Math.round(clip.x), y: Math.round(clip.y), width: Math.round(clip.width), height: Math.round(clip.height) },
       scale: clip.scale,
-      cropped_to_element: !!(rect && rect.w > 0),
+      ...(rect?.el ? { element_at: { x: Math.round(rect.el.x), y: Math.round(rect.el.y), width: Math.round(rect.el.w), height: Math.round(rect.el.h) } } : {}),
+      covers: rect && rect.w > 0 ? 'the control, its form and any error text on screen' : 'viewport',
     };
   } catch {
     return null;
@@ -4239,12 +4267,21 @@ async function dispatchCore(port, method, params) {
               const [c] = await chrome.scripting.executeScript({
                 target: { tabId: tab.id }, world: 'MAIN',
                 func: () => {
+                  // Prefer what was seen as it appeared: a toast that has already
+                  // dismissed itself cannot be read off the page afterwards.
+                  const list = window.__bmcpConfirmations || [];
+                  const seen = list.length ? list[list.length - 1] : null;
+                  list.length = 0; // consumed, so the next row cannot inherit it
+                  if (seen) return { value: seen, from: 'captured as it appeared' };
                   const t = (document.body?.innerText || '').replace(/\s+/g, ' ');
-                  const m = t.match(/(confirmation|reference|application|receipt|order)\s*(?:id|number|no\.?|#)?\s*[:#]?\s*([A-Z0-9][A-Z0-9-]{4,20})/i);
-                  return m ? m[0].slice(0, 60) : null;
+                  const m = t.match(/(?:[Cc]onfirmation|[Rr]eference|[Aa]pplication|[Rr]eceipt|[Oo]rder|[Tt]racking)\s*(?:[Ii][Dd]|[Nn]umber|[Nn]o\.?|#)?\s*[:#]\s*([A-Z0-9][A-Z0-9-]{3,24})/);
+                  return m ? { value: m[0].slice(0, 60), from: 'read from the page' } : null;
                 },
               });
-              if (c?.result) entry.confirmation = c.result;
+              if (c?.result?.value) {
+                entry.confirmation = c.result.value;
+                entry.confirmation_source = c.result.from;
+              }
             } catch {}
           } else {
             entry.status = kind === 'structural' ? 'failed' : 'skipped';

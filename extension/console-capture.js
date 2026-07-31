@@ -26,6 +26,35 @@
     }
   } catch (e) { /* policy name taken or policies locked down — callers fall back */ }
 
+  // Confirmation references are frequently shown in a toast that removes itself
+  // after a few seconds, so anything that looks for one once the step has finished
+  // finds nothing exactly where a record of it matters most. Watching from
+  // document_start also survives the navigation that usually precedes the toast,
+  // which an observer installed per step does not.
+  if (!window.__bmcpConfirmations) {
+    window.__bmcpConfirmations = [];
+    const RE = /(?:[Cc]onfirmation|[Rr]eference|[Aa]pplication|[Rr]eceipt|[Oo]rder|[Tt]racking)\s*(?:[Ii][Dd]|[Nn]umber|[Nn]o\.?|#)?\s*[:#]\s*([A-Z0-9][A-Z0-9-]{3,24})/;
+    const note = (node) => {
+      try {
+        const t = (node.innerText || node.textContent || '').replace(/\s+/g, ' ');
+        if (!t || t.length > 400) return;
+        const m = RE.exec(t);
+        if (m && !window.__bmcpConfirmations.includes(m[0])) {
+          window.__bmcpConfirmations.push(m[0].slice(0, 80));
+          if (window.__bmcpConfirmations.length > 20) window.__bmcpConfirmations.shift();
+        }
+      } catch (e) {}
+    };
+    const start = () => {
+      if (document.body) note(document.body);
+      new MutationObserver((muts) => {
+        for (const mu of muts) for (const n of mu.addedNodes) if (n.nodeType === 1) note(n);
+      }).observe(document.documentElement, { childList: true, subtree: true });
+    };
+    if (document.documentElement) start();
+    else document.addEventListener('readystatechange', start, { once: true });
+  }
+
   if (window.__mcpConsoleLogs) return; // already installed (SPA soft-nav, double-inject)
   const MAX = 500;
   const logs = [];
