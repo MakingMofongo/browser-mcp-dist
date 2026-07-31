@@ -4651,7 +4651,41 @@ async function dispatchCore(port, method, params) {
         const [chk] = await chrome.scripting.executeScript({
           target: { tabId: tab.id }, world: 'MAIN',
           args: [[...written.values()].map(w => [w.selector, w.value])],
-          func: (pairs) => pairs.map(([sel, want]) => {
+          func: (pairs) => {
+          // What the form will actually serialise, worked out here and never sent
+          // back. A field can hold the right value on screen and still not be in
+          // the payload at all — disabled controls, anything without a name, and
+          // anything sitting outside the <form> all read as filled and are simply
+          // not submitted. Reading the DOM cannot see that; the payload can. Only
+          // the verdict leaves the page, never a value, so this stays true of a
+          // password as much as anything else.
+          const payloadCheck = (() => {
+            try {
+              const forms = [...document.querySelectorAll('form')];
+              if (!forms.length) return null;
+              const out = [];
+              for (const [sel, want] of pairs) {
+                let el = null;
+                const rm = /^ref[_=](\d+)$/.exec(sel);
+                if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+                if (!el) { try { el = document.querySelector(sel); } catch (e) {} }
+                if (!el || !el.isConnected) continue;
+                const form = el.form || (el.closest && el.closest('form'));
+                const label = (el.labels && el.labels[0] ? el.labels[0].textContent : '') || el.getAttribute('aria-label') || el.name || el.id || sel;
+                const named = { field: String(label).replace(/\s+/g, ' ').trim().slice(0, 40) };
+                if (!form) { out.push({ ...named, sent: false, why: 'not inside a form' }); continue; }
+                if (!el.name) { out.push({ ...named, sent: false, why: 'the control has no name attribute' }); continue; }
+                if (el.disabled) { out.push({ ...named, sent: false, why: 'the control is disabled' }); continue; }
+                let values = [];
+                try { values = new FormData(form).getAll(el.name).map(v => typeof v === 'string' ? v : '(file)'); } catch (e) { continue; }
+                if (!values.length) { out.push({ ...named, sent: false, why: 'the form does not carry this field' }); continue; }
+                out.push({ ...named, sent: true, matches: values.includes(want) });
+              }
+              return out;
+            } catch (e) { return null; }
+          })();
+
+          const rows = pairs.map(([sel, want]) => {
             let el = null;
             const rm = /^ref[_=](\d+)$/.exec(sel);
             if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
@@ -4661,11 +4695,31 @@ async function dispatchCore(port, method, params) {
             if (now === want) return { sel, state: 'kept' };
             if (!now.trim()) return { sel, state: 'lost', label: (el.labels && el.labels[0] ? el.labels[0].textContent : el.name || el.id || '').trim().slice(0, 40) };
             return { sel, state: 'changed', now: now.slice(0, 60) };
-          }),
+          });
+          return { rows, payload: payloadCheck };
+          },
         }).catch(() => [null]);
-        const rows = chk?.result || [];
+        const rows = chk?.result?.rows || [];
+        const payload = chk?.result?.payload || null;
         const lost = rows.filter(r => r.state === 'lost');
         const changed = rows.filter(r => r.state === 'changed');
+
+        // A field that will not be serialised is unambiguous: whatever the screen
+        // shows, that data is not going to arrive. Refused for the same reason an
+        // empty field is. A value the form carries but normalises — brackets added
+        // to a phone number, a name upper-cased — is reported and allowed, because
+        // refusing those would stop on most real forms.
+        const dropped = (payload || []).filter(p => p.sent === false);
+        if (dropped.length && params.verify_fields !== false) {
+          return {
+            ok: false, outcome: 'fields_not_submitted', submitted: false,
+            error: `${dropped.length} filled field${dropped.length > 1 ? 's are' : ' is'} not part of what this form will send, so submitting now would lose ${dropped.length > 1 ? 'them' : 'it'}. Nothing was clicked.`,
+            fields: dropped.map(d => ({ field: d.field, reason: d.why })),
+            hint: 'The value is on the page but will not be serialised. Usually the control is disabled, has no name attribute, or sits outside the form element. Pass verify_fields:false to submit regardless.',
+          };
+        }
+        const altered = (payload || []).filter(p => p.sent && p.matches === false);
+        if (altered.length) reformatted = (reformatted || []).concat(altered.map(a => ({ field: a.field, note: 'the form will send a different value than was written' })));
         if (lost.length) {
           return {
             ok: false, outcome: 'fields_lost', submitted: false,
