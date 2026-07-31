@@ -3017,14 +3017,50 @@ async function recordStep(port, method, params, result) {
   rec.steps.push(step);
 }
 
+// What this session has written into the page, so submit can check it is all
+// still there. Some frameworks re-render a field from their own state when it
+// loses focus and drop a value that was set on the element — the field looked
+// right at the time, the read-back agreed, and the record saves blank. Nothing
+// catches that at the moment of filling; it only shows up later, so the check
+// belongs immediately before the thing that would commit it.
+const writtenValues = new Map(); // tabId → Map(label → {selector, value, at})
+
+function noteWritten(tabId, selector, value) {
+  if (!tabId || !selector || typeof value !== 'string') return;
+  let m = writtenValues.get(tabId);
+  if (!m) { m = new Map(); writtenValues.set(tabId, m); }
+  m.set(selector, { selector, value, at: Date.now() });
+  if (m.size > 120) m.delete(m.keys().next().value);
+}
+
+// A new document means new fields; anything remembered would be about a page
+// that is gone.
+chrome.webNavigation?.onCommitted?.addListener((d) => {
+  if (d.frameId === 0) writtenValues.delete(d.tabId);
+});
+
 async function dispatch(port, method, params) {
   const rec = recording.get(port);
   if (rec && RECORDABLE.has(method)) {
     const result = await dispatchInner(port, method, params);
     await recordStep(port, method, params, result).catch(() => {});
+    await trackWrite(port, method, params, result);
     return result;
   }
-  return dispatchInner(port, method, params);
+  const result = await dispatchInner(port, method, params);
+  await trackWrite(port, method, params, result);
+  return result;
+}
+
+const WRITES = new Set(['fill', 'fill_legacy', 'set_date', 'select_option', 'set_combobox']);
+async function trackWrite(port, method, params, result) {
+  if (!WRITES.has(method) || !result || result.ok === false || !params?.selector) return;
+  const value = method === 'set_date' ? params.date
+    : method === 'select_option' ? (result.selected ?? params.option)
+    : method === 'set_combobox' ? (Array.isArray(params.values) ? params.values[0] : params.values)
+    : params.value;
+  if (typeof value !== 'string' || !value) return;
+  try { noteWritten((await getSessionTab(port)).id, params.selector, value); } catch {}
 }
 
 async function dispatchInner(port, method, params) {
@@ -4217,6 +4253,45 @@ async function dispatchCore(port, method, params) {
 
       const before = await snap();
       if (!before) return { ok: false, error: 'Could not read page state (still loading?)' };
+      let reformatted = null;
+
+      // Last chance to notice a field that quietly emptied itself. Checked here
+      // rather than at fill time because the framework discards the value when
+      // focus leaves, which is after the fill has already reported success.
+      const written = writtenValues.get(tab.id);
+      if (written?.size && params.verify_fields !== false) {
+        const [chk] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: 'MAIN',
+          args: [[...written.values()].map(w => [w.selector, w.value])],
+          func: (pairs) => pairs.map(([sel, want]) => {
+            let el = null;
+            const rm = /^ref[_=](\d+)$/.exec(sel);
+            if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+            else { try { el = document.querySelector(sel); } catch (e) {} }
+            if (!el || !el.isConnected) return { sel, state: 'gone' };
+            const now = el.isContentEditable ? (el.textContent || '') : String(el.value ?? '');
+            if (now === want) return { sel, state: 'kept' };
+            if (!now.trim()) return { sel, state: 'lost', label: (el.labels && el.labels[0] ? el.labels[0].textContent : el.name || el.id || '').trim().slice(0, 40) };
+            return { sel, state: 'changed', now: now.slice(0, 60) };
+          }),
+        }).catch(() => [null]);
+        const rows = chk?.result || [];
+        const lost = rows.filter(r => r.state === 'lost');
+        const changed = rows.filter(r => r.state === 'changed');
+        if (lost.length) {
+          return {
+            ok: false, outcome: 'fields_lost', submitted: false,
+            error: `${lost.length} field${lost.length > 1 ? 's are' : ' is'} empty again after being filled, so submitting now would save ${lost.length > 1 ? 'blanks' : 'a blank'}. Nothing was clicked.`,
+            fields: lost.map(l => ({ selector: l.sel, label: l.label || undefined })),
+            hint: 'The page took the value and then discarded it, which usually means the field needs real typing rather than a set value. Re-fill it and check it survives moving focus away before submitting. Pass verify_fields:false to submit regardless.',
+          };
+        }
+        if (changed.length) {
+          // Reformatting is normal — a phone number gaining brackets is not a
+          // fault — so this is said, not acted on.
+          reformatted = changed.map(c => ({ selector: c.sel, now: c.now }));
+        }
+      }
 
       // Locate the submit control if the caller did not name one.
       let selector = params.selector;
@@ -4265,27 +4340,27 @@ async function dispatchCore(port, method, params) {
           await new Promise(r => setTimeout(r, 500));
           const t2 = await chrome.tabs.get(tab.id).catch(() => null);
           if (t2 && t2.url !== before.url) {
-            return { ok: true, outcome: 'navigated', url_before: before.url, url_after: t2.url, waited_ms: Date.now() - started, click: clickRes };
+            return { ok: true, outcome: 'navigated', ...(reformatted ? { reformatted } : {}), url_before: before.url, url_after: t2.url, waited_ms: Date.now() - started, click: clickRes };
           }
           continue;
         }
         last = now;
         if (now.url !== before.url) {
-          return { ok: true, outcome: 'navigated', url_before: before.url, url_after: now.url, title: now.title, waited_ms: Date.now() - started, click: clickRes };
+          return { ok: true, outcome: 'navigated', ...(reformatted ? { reformatted } : {}), url_before: before.url, url_after: now.url, title: now.title, waited_ms: Date.now() - started, click: clickRes };
         }
         const newErrors = now.errors.filter(e => !before.errors.includes(e));
         if (newErrors.length) {
-          return { ok: false, outcome: 'validation_error', errors: newErrors, url: now.url, waited_ms: Date.now() - started, click: clickRes,
+          return { ok: false, outcome: 'validation_error', ...(reformatted ? { reformatted } : {}), errors: newErrors, url: now.url, waited_ms: Date.now() - started, click: clickRes,
             hint: 'The form was submitted and REJECTED. Fix these fields (browser_form_state shows which are invalid) and submit again.' };
         }
         if (params.expect_text && now.hasExpect && !before.hasExpect) {
-          return { ok: true, outcome: 'expected_text', matched: params.expect_text, url: now.url, waited_ms: Date.now() - started, click: clickRes };
+          return { ok: true, outcome: 'expected_text', ...(reformatted ? { reformatted } : {}), matched: params.expect_text, url: now.url, waited_ms: Date.now() - started, click: clickRes };
         }
         if (params.expect_gone && before.hasGone && !now.hasGone) {
           return { ok: true, outcome: 'expected_gone', url: now.url, waited_ms: Date.now() - started, click: clickRes };
         }
         if (!now.busy && now.sig !== before.sig && Math.abs(now.len - before.len) > Math.max(80, before.len * 0.12)) {
-          return { ok: true, outcome: 'page_changed', url: now.url, waited_ms: Date.now() - started, click: clickRes,
+          return { ok: true, outcome: 'page_changed', ...(reformatted ? { reformatted } : {}), url: now.url, waited_ms: Date.now() - started, click: clickRes,
             note: 'Content changed substantially but no navigation and no expected text — verify it is the state you wanted.' };
         }
       }
