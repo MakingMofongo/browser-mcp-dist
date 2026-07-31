@@ -440,6 +440,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       url: (params.request?.url || '').slice(0, 300),
       type: params.type,
       started: params.timestamp,
+      t0: Date.now(),
     });
     if (buf.length > NET_MAX) buf.splice(0, buf.length - NET_MAX);
   } else if (method === 'Network.responseReceived') {
@@ -4270,11 +4271,22 @@ async function dispatchCore(port, method, params) {
       if (params.start_url !== false && flow.start_url) {
         await dispatchCore(port, 'navigate', { url: flow.start_url }).catch(() => {});
         // Recorded URLs carry session tokens — retURL, jsessionid, sap-client — that
-        // go stale. The result is a login or expired-session page that reads as a
-        // perfectly ordinary page, so every step then fails for the wrong reason.
+        // go stale, landing on a sign-in or expired-session page that reads as an
+        // ordinary page. The flow itself is the ground truth for whether this is the
+        // right page: only when its first target is missing is it worth asking why.
+        // Guessing from page text alone flags every legitimate login flow as stale.
         try {
+          const firstStep = flow.steps.find(s => s.target && !s.optional);
+          let onExpectedPage = true;
+          if (firstStep) {
+            const t0 = await getSessionTab(port);
+            const [probe] = await chrome.scripting.executeScript({
+              target: { tabId: t0.id }, world: 'MAIN', func: bmcpResolvePortable, args: [firstStep.target],
+            }).catch(() => [null]);
+            onExpectedPage = probe?.result?.found === true;
+          }
           const t = await getSessionTab(port);
-          const [chk] = await chrome.scripting.executeScript({
+          const [chk] = onExpectedPage ? [null] : await chrome.scripting.executeScript({
             target: { tabId: t.id }, world: 'MAIN',
             func: () => {
               const text = (document.body?.innerText || '').slice(0, 3000).toLowerCase();
@@ -4284,9 +4296,9 @@ async function dispatchCore(port, method, params) {
               const hit = signals.find(s => text.includes(s));
               return { pw, hit: hit || null, url: location.href, title: document.title };
             },
-          });
+          }).catch(() => [null]);
           const c = chk?.result;
-          if (c && (c.hit || (c.pw && /login|signin|sign-in|auth/i.test(c.url)))) {
+          if (c && (c.hit || c.pw)) {
             return {
               ok: false, flow: params.name, steps_run: 0, steps_total: flow.steps.length,
               diverged_at: { step: -1, reason: 'start-url-stale', landed_on: c.url, signal: c.hit || 'a password field on a login-looking URL' },
@@ -4542,8 +4554,12 @@ async function dispatchCore(port, method, params) {
 
       const inflight = () => {
         const buf = networkLogs.get(tab.id) || [];
-        // A request with no status yet and started recently is still in flight.
-        return buf.filter(e => e.status === undefined && !e.failed).length;
+        // Long-polls, aborted requests and connections the page never closes never
+        // receive a response, so counting every status-less entry as in flight meant
+        // a page with one of them could never be called settled and always burned
+        // the full timeout.
+        const now = Date.now();
+        return buf.filter(e => e.status === undefined && !e.failed && (now - (e.t0 || 0)) < 10000).length;
       };
 
       let reason = 'timeout';
@@ -4640,7 +4656,7 @@ async function dispatchCore(port, method, params) {
 
       const total = out.length;
       const bodyChars = Math.min(200000, params.max_body_chars || 4000);
-      out = out.slice(-(params.limit || 50)).map(({ started, body, ...rest }) => {
+      out = out.slice(-(params.limit || 50)).map(({ started, t0, body, ...rest }) => {
         // Bodies are captured always but returned only when asked for, so the
         // default listing stays small.
         if (!params.include_body) {
