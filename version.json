@@ -1,0 +1,16 @@
+{
+  "version": "2.4.1",
+  "extension_id": "apcaminghehhiafleljmdhjhfimndngf",
+  "files": [
+    "background.js",
+    "console-capture.js",
+    "icons/icon-128.png",
+    "icons/icon-16.png",
+    "icons/icon-48.png",
+    "manifest.json",
+    "offscreen.html",
+    "offscreen.js",
+    "popup.html",
+    "popup.js"
+  ]
+}
