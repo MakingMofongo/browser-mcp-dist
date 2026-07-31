@@ -860,12 +860,30 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
         const t = (x.textContent || '').trim().replace(/\s+/g, ' ');
         return t ? t.slice(0, 80) : (x.name || x.id || '');
       };
-      const cands = walkAll(document, []).filter(x =>
+      let cands = walkAll(document, []).filter(x =>
         x.tagName === meta.tag &&
         (meta.type ? (x.type || '').toLowerCase() === meta.type : true) &&
         nm(x) === meta.name);
+      if (cands.length > 1 && meta.anchor) {
+        const anch = (el2) => {
+          const fs = el2.closest && el2.closest('fieldset');
+          if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/s+/g, ' ').slice(0, 60); }
+          const sec = el2.closest && el2.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+          if (sec) {
+            const al = sec.getAttribute && sec.getAttribute('aria-label');
+            if (al) return al.trim().slice(0, 60);
+            const cell = sec.querySelector && sec.querySelector('th, td, [role="rowheader"]');
+            if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/s+/g, ' ').slice(0, 60);
+          }
+          return null;
+        };
+        const byAnchor = cands.filter(x => anch(x) === meta.anchor);
+        if (byAnchor.length) cands = byAnchor;
+      }
       if (!cands.length) return null;
-      e = cands[Math.min(meta.idx || 0, cands.length - 1)];
+      // Writing into the wrong row is worse than not writing at all.
+      if (cands.length > 1) { window.__bmcpRefAmbiguous = cands.length; return null; }
+      e = cands[0];
       window.__bmcpRefEls[key] = e;
       window.__bmcpRefHealed = key;
       return e;
@@ -964,6 +982,12 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
     return { gone: false, value: now, repaired, collateral };
   }
 
+  if (op === 'ambiguity') {
+    const c = window.__bmcpRefAmbiguous || 0;
+    try { delete window.__bmcpRefAmbiguous; } catch (e) { window.__bmcpRefAmbiguous = 0; }
+    return { count: c };
+  }
+
   if (op === 'focuscheck') {
     const el = tagged();
     if (!el) return { focused: false };
@@ -991,7 +1015,19 @@ async function fillElementDeep(tabId, selector, value) {
   // 1. Locate ONCE (shadow-piercing), tag it, focus it, report whether focus stuck.
   const info = await inject(['locate', selector, BMCP_TAG, null]);
 
-  if (!info || !info.found) return { ok: false, error: 'Element not found: ' + selector };
+  if (!info || !info.found) {
+    // Distinguish "gone" from "matches several now" — the second is a refusal to
+    // act on the wrong element, and the caller needs to know which it was.
+    const amb = await inject(['ambiguity', null, BMCP_TAG, null]).catch(() => null);
+    if (amb && amb.count > 1) {
+      return {
+        ok: false,
+        error: `${selector} was replaced and now matches ${amb.count} elements with the same label, even after narrowing by container. Refusing to pick by position, which would write into the wrong one. Re-run browser_read_page or browser_form_state for a current reference.`,
+        ambiguous: amb.count,
+      };
+    }
+    return { ok: false, error: 'Element not found: ' + selector };
+  }
 
   // 2. Trusted typing ONLY when focus verifiably landed on our element. Otherwise
   //    keystrokes would go to whatever else holds focus — the Gmail failure.
@@ -1317,14 +1353,35 @@ function bmcpResolveRef(key) {
       for (const e of root.querySelectorAll('*')) { all.push(e); if (e.shadowRoot) walk(e.shadowRoot); }
     };
     walk(document);
-    const sameKind = all.filter(e =>
+    const anchorOf = (e) => {
+      const fs = e.closest && e.closest('fieldset');
+      if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/\s+/g, ' ').slice(0, 60); }
+      const sec = e.closest && e.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+      if (sec) {
+        const al = sec.getAttribute && sec.getAttribute('aria-label');
+        if (al) return al.trim().slice(0, 60);
+        const cell = sec.querySelector && sec.querySelector('th, td, [role="rowheader"]');
+        if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/\s+/g, ' ').slice(0, 60);
+      }
+      return null;
+    };
+    let sameKind = all.filter(e =>
       e.tagName === meta.tag &&
       (meta.type ? (e.type || '').toLowerCase() === meta.type : true) &&
       nameOf(e) === meta.name);
-    if (sameKind.length) {
-      el = sameKind[Math.min(meta.idx || 0, sameKind.length - 1)];
+    // Narrow by the container the element was recorded in before considering position.
+    if (sameKind.length > 1 && meta.anchor) {
+      const byAnchor = sameKind.filter(e => anchorOf(e) === meta.anchor);
+      if (byAnchor.length) sameKind = byAnchor;
+    }
+    if (sameKind.length === 1) {
+      el = sameKind[0];
       healed = true;
       refs[key] = el;
+    } else if (sameKind.length > 1) {
+      // Position is not identity. Guessing here lands on the wrong record, which
+      // is worse than reporting that the reference can no longer be resolved.
+      return { error: 'ambiguous-ref', candidates: sameKind.length, name: meta.name, anchor: meta.anchor || null };
     }
   }
 
@@ -1344,8 +1401,14 @@ async function resolveRefElement(tabId, refKey) {
   });
   const res = r?.[0]?.result;
   if (!res || res.error) {
+    if (res?.error === 'ambiguous-ref') {
+      throw new Error(
+        `Ref ${refKey} was replaced and now matches ${res.candidates} elements named "${res.name}"` +
+        (res.anchor ? ` even within "${res.anchor}"` : '') +
+        '. Refusing to guess by position, which would act on the wrong one. Re-run browser_read_page or browser_find to get an unambiguous reference.');
+    }
     throw new Error(res?.error === 'stale-ref'
-      ? `Ref ${refKey} no longer matches anything on the page — it was replaced and could not be re-identified by role, name or position. Re-run browser_read_page or browser_find.`
+      ? `Ref ${refKey} no longer matches anything on the page — it was replaced and could not be re-identified. Re-run browser_read_page or browser_find.`
       : `Unknown ref ${refKey} on this page. Run browser_read_page or browser_find first (refs are per-page and reset on navigation).`);
   }
   return res;
@@ -1467,11 +1530,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // v2.0: echo active-tab context on every response (like Claude-in-Chrome's
           // "Tab Context" footer) so the model never drifts on which page it's driving.
           if (result && typeof result === 'object' && !Array.isArray(result) && !result.__error) {
+            // Always, not only when the result lacks a url. When something goes
+            // wrong three steps later, knowing which tab each call acted on and
+            // where it was is the difference between reading the trail and
+            // spending a full page read to re-orient.
             try {
               const s = sessions.get(port);
-              if (s?.activeTabId && result.url === undefined) {
+              if (s?.activeTabId) {
                 const t = await chrome.tabs.get(s.activeTabId);
-                result._tab = { id: t.id, url: (t.url || '').slice(0, 120), title: (t.title || '').slice(0, 80) };
+                result._tab = `tab ${t.id} · ${(t.url || '').replace(/^https?:\/\//, '').slice(0, 90)}`;
               }
             } catch {}
           }
@@ -2006,8 +2073,36 @@ async function dismissOverlays(tabId, scope = 'non_critical', maxPasses = 3) {
         return rect.width > 0 && rect.height > 0;
       };
 
+      // Consent dialogs get a decision, not just a close. Where a banner offers
+      // both, take the option that shares the least: rejecting non-essential
+      // cookies is the choice a user would want made on their behalf, and an
+      // agent silently accepting all tracking on every site is not acceptable.
+      const rejectTexts = [
+        'reject all', 'reject non-essential', 'reject', 'decline all', 'decline',
+        'necessary only', 'only necessary', 'essential only', 'only essential',
+        'strictly necessary', 'deny', 'refuse', 'afvis alle', 'afvis',
+      ];
+      const acceptTexts = ['accept all', 'accept cookies', 'allow all', 'i agree', 'agree', 'accept'];
+
       const findCloseAffordance = (overlay, allowAmbiguous) => {
         const all = [...overlay.querySelectorAll('button, [role="button"], a[href="#"], [aria-label]')];
+
+        // Reject before accept, and only consider accept when no refusal exists.
+        const looksConsent = /cookie|consent|privacy|tracking|gdpr/i.test(
+          (overlay.getAttribute('aria-label') || '') + ' ' + (overlay.textContent || '').slice(0, 400));
+        if (looksConsent) {
+          for (const list of [rejectTexts, acceptTexts]) {
+            for (const c of all) {
+              if (!isVisible(c)) continue;
+              const t = (c.textContent || '').trim().toLowerCase();
+              if (!t || t.length > 40) continue;
+              if (list.some(x => t === x || t.startsWith(x))) {
+                return { el: c, method: list === rejectTexts ? 'consent-reject' : 'consent-accept', label: t };
+              }
+            }
+          }
+        }
+
         const allTexts = allowAmbiguous ? [...safeTexts, ...ambiguousTexts] : safeTexts;
 
         // Priority 1: aria-label match (close/dismiss/luk/afvis are always safe)
@@ -2095,14 +2190,17 @@ async function dismissOverlays(tabId, scope = 'non_critical', maxPasses = 3) {
         // button that submits it. Closing that is not tidying up, it is discarding
         // the step. Anything carrying a submit control is left alone unless the
         // caller explicitly asked for aggressive.
+        // A submit control alone does not make a dialog a form: consent banners
+        // routinely wrap "Accept all" in a form as type=submit, and refusing those
+        // would break the exact case this tool exists for. What distinguishes a
+        // workflow modal is a submit control AND fields to submit.
         const submitish = /^(submit|save|continue|next|apply|pay|confirm|send|finish|update|create|add|book|sign in|log in)\b/i;
         const hasSubmit = !!overlay.querySelector('button[type="submit"], input[type="submit"]') ||
           [...overlay.querySelectorAll('button, [role="button"], a.btn')].some(b => submitish.test((b.textContent || '').trim()));
-        if (s !== 'aggressive' && hasSubmit) {
+        if (s !== 'aggressive' && hasSubmit && hasTextFields) {
           skipped.push({
             role,
-            reason: 'left alone: contains a submit control, so this dialog is probably the form itself',
-            hasTextFields,
+            reason: 'left alone: has editable fields and a submit control, so this dialog is probably the form itself',
           });
           continue;
         }
@@ -4992,9 +5090,24 @@ async function dispatchCore(port, method, params) {
                 const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
                 return t ? t.slice(0, 80) : (e.name || e.id || '');
               };
+              // Anchor to the nearest labelled container. Position among identical
+              // peers is not identity: inserting a row above shifts every index, and
+              // re-identifying by index alone lands confidently on the wrong record.
+              const anchorOf = (e) => {
+                const fs = e.closest && e.closest('fieldset');
+                if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/s+/g, ' ').slice(0, 60); }
+                const sec = e.closest && e.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+                if (sec) {
+                  const al = sec.getAttribute && sec.getAttribute('aria-label');
+                  if (al) return al.trim().slice(0, 60);
+                  const cell = sec.querySelector && sec.querySelector('th, td, [role="rowheader"]');
+                  if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/s+/g, ' ').slice(0, 60);
+                }
+                return null;
+              };
               const myName = nm(el);
               const peers = [...document.querySelectorAll(el.tagName)].filter(p => nm(p) === myName);
-              window.__bmcpRefMeta[key] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)) };
+              window.__bmcpRefMeta[key] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)), anchor: anchorOf(el), peer_count: peers.length };
             } catch {}
             return key;
           };
@@ -5126,9 +5239,24 @@ async function dispatchCore(port, method, params) {
                 const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
                 return t ? t.slice(0, 80) : (e.name || e.id || '');
               };
+              // Anchor to the nearest labelled container. Position among identical
+              // peers is not identity: inserting a row above shifts every index, and
+              // re-identifying by index alone lands confidently on the wrong record.
+              const anchorOf = (e) => {
+                const fs = e.closest && e.closest('fieldset');
+                if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/s+/g, ' ').slice(0, 60); }
+                const sec = e.closest && e.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+                if (sec) {
+                  const al = sec.getAttribute && sec.getAttribute('aria-label');
+                  if (al) return al.trim().slice(0, 60);
+                  const cell = sec.querySelector && sec.querySelector('th, td, [role="rowheader"]');
+                  if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/s+/g, ' ').slice(0, 60);
+                }
+                return null;
+              };
               const myName = nm(el);
               const peers = [...document.querySelectorAll(el.tagName)].filter(p => nm(p) === myName);
-              window.__bmcpRefMeta[k] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)) };
+              window.__bmcpRefMeta[k] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)), anchor: anchorOf(el), peer_count: peers.length };
             } catch {}
             return k;
           };
@@ -5239,9 +5367,24 @@ async function dispatchCore(port, method, params) {
                 const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
                 return t ? t.slice(0, 80) : (e.name || e.id || '');
               };
+              // Anchor to the nearest labelled container. Position among identical
+              // peers is not identity: inserting a row above shifts every index, and
+              // re-identifying by index alone lands confidently on the wrong record.
+              const anchorOf = (e) => {
+                const fs = e.closest && e.closest('fieldset');
+                if (fs) { const lg = fs.querySelector('legend'); if (lg && lg.textContent.trim()) return lg.textContent.trim().replace(/s+/g, ' ').slice(0, 60); }
+                const sec = e.closest && e.closest('[aria-label], [role="row"], tr, [role="group"], section, li');
+                if (sec) {
+                  const al = sec.getAttribute && sec.getAttribute('aria-label');
+                  if (al) return al.trim().slice(0, 60);
+                  const cell = sec.querySelector && sec.querySelector('th, td, [role="rowheader"]');
+                  if (cell && cell.textContent.trim()) return cell.textContent.trim().replace(/s+/g, ' ').slice(0, 60);
+                }
+                return null;
+              };
               const myName = nm(el);
               const peers = [...document.querySelectorAll(el.tagName)].filter(p => nm(p) === myName);
-              window.__bmcpRefMeta[key] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)) };
+              window.__bmcpRefMeta[key] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)), anchor: anchorOf(el), peer_count: peers.length };
             } catch {}
             return key;
           };
