@@ -2466,6 +2466,60 @@ async function dropFileOnTarget(tabId, selector, files) {
 
 // ── Command Dispatcher ──────────────────────────────────────────────────────
 
+// ── Auth walls ─────────────────────────────────────────────────────────────
+// A portal deciding mid-run that the session is stale looks, to a structural check,
+// exactly like the page having changed. The distinction matters: a changed page
+// means the flow is wrong and needs re-recording, while an auth wall means the flow
+// is fine and a human needs to sign in once. Only the second is worth waking
+// someone for, and only the second should leave its rows ready to run.
+function bmcpDetectAuthWall() {
+  const text = (document.body ? document.body.innerText || '' : '').slice(0, 4000);
+  const low = text.toLowerCase();
+  const host = location.hostname;
+
+  const SSO_HOSTS = /(login\.microsoftonline\.com|login\.live\.com|accounts\.google\.com|okta\.com|onelogin\.com|auth0\.com|pingidentity|adfs|shibboleth|idp\.|sso\.|duosecurity\.com|login\.salesforce\.com)/i;
+  const PHRASES = [
+    'session has expired', 'session expired', 'your session timed out', 'session timeout',
+    'please sign in', 'please log in', 'sign in to continue', 'log in to continue',
+    'authentication required', 'verify your identity', 'verification code',
+    'two-factor', 'two factor', 'multi-factor', 'one-time passcode', 'one time password',
+    'enter the code we sent', 'we sent a code', 'authenticator app', 'security check',
+    'you have been signed out', 'you have been logged out', 're-authenticate',
+  ];
+  const phrase = PHRASES.find(p => low.includes(p));
+
+  const pw = document.querySelector('input[type="password"]');
+  const otp = document.querySelector(
+    'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i], input[id*="otp" i], input[name*="verification" i], input[name*="passcode" i]');
+  const ssoHost = SSO_HOSTS.test(host);
+
+  if (!phrase && !pw && !otp && !ssoHost) return { auth_wall: false };
+  // A password box on a page the flow expected is not necessarily a wall — the
+  // phrase, the one-time-code field or a redirect to an identity provider are what
+  // make it one.
+  const kind = otp ? 'a one-time code prompt'
+    : ssoHost ? 'a redirect to an identity provider (' + host + ')'
+    : phrase ? 'the page saying "' + phrase + '"'
+    : 'a password field';
+  const strong = !!(otp || ssoHost || phrase);
+  return {
+    auth_wall: strong,
+    weak_signal: !strong,
+    evidence: kind,
+    url: location.href,
+    title: document.title,
+  };
+}
+
+async function detectAuthWall(tabId) {
+  try {
+    const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: bmcpDetectAuthWall });
+    return r?.result || { auth_wall: false };
+  } catch {
+    return { auth_wall: false };
+  }
+}
+
 // ── Flow recording and replay ──────────────────────────────────────────────
 // A recorded step must survive a fresh page load, so the target is stored as a
 // durable identity (id, name attribute, or role + accessible name + index) rather
@@ -4205,6 +4259,7 @@ async function dispatchCore(port, method, params) {
         // portal whose shape has changed.
         const classify = (d) => {
           if (!d) return null;
+          if (d.reason === 'auth-wall') return 'auth';
           if (d.reason === 'target-not-found') return 'structural';
           const a = d.actual || {};
           const blob = JSON.stringify(a);
@@ -4220,7 +4275,7 @@ async function dispatchCore(port, method, params) {
           .length;
 
         await persist();
-        let stopped = null;
+        let stopped = null, authWall = null;
         for (const entry of ledger.rows) {
           if (entry.status === 'done' || entry.status === 'skipped') continue;
           if (entry.status === 'in_progress' && !params.retry_committed) {
@@ -4299,6 +4354,19 @@ async function dispatchCore(port, method, params) {
           }
           await persist();
 
+          if (kind === 'auth') {
+            // Nothing is wrong with the flow, so the row goes back to pending unless
+            // something may already have been sent. The rest of the queue is
+            // untouched and the run resumes after a person signs in once.
+            entry.status = entry.possibly_committed ? 'needs_review' : 'pending';
+            delete entry.kind;
+            await persist();
+            authWall = r.diverged_at?.evidence || 'a sign-in or verification page';
+            entry.paused_for = 'authentication';
+            entry.auth_evidence = authWall;
+            stopped = entry;
+            break;
+          }
           if (kind === 'structural') {
             stopped = entry;
             break;
@@ -4317,7 +4385,15 @@ async function dispatchCore(port, method, params) {
           rows_total: ledger.rows.length,
           ...counts,
           failures: failures.length ? failures : undefined,
-          ...(stopped ? {
+          ...(stopped && authWall ? {
+            paused_at_row: stopped.index,
+            paused_for: 'authentication',
+            detected: authWall,
+            reason: 'the site asked for authentication part way through the run',
+            remaining: (counts.pending || 0),
+            hint: `Sign in once in the browser, then continue with browser_replay({name:"${params.name}", resume:"${runId}"}). The queue is intact and this row was left ready to run rather than counted as failed. Nothing about the flow is wrong, so it does not need re-recording. Tell the user now: an unattended run cannot get past this on its own.`,
+          } : {}),
+          ...(stopped && !authWall ? {
             paused_at_row: stopped.index,
             reason: 'structural divergence — the page no longer matches the recording, so the remaining rows would fail the same way',
             remaining: counts.pending || 0,
@@ -4364,10 +4440,15 @@ async function dispatchCore(port, method, params) {
           }).catch(() => [null]);
           const c = chk?.result;
           if (c && (c.hit || c.pw)) {
+            const wall = await detectAuthWall(t.id);
             return {
               ok: false, flow: params.name, steps_run: 0, steps_total: flow.steps.length,
-              diverged_at: { step: -1, reason: 'start-url-stale', landed_on: c.url, signal: c.hit || 'a password field on a login-looking URL' },
-              hint: 'The recorded starting URL led to a sign-in or expired-session page rather than the flow. Its session token has gone stale. Sign in, then replay with start_url:false from the right page, or re-record the flow.',
+              diverged_at: wall.auth_wall
+                ? { step: -1, reason: 'auth-wall', evidence: wall.evidence, landed_on: c.url }
+                : { step: -1, reason: 'start-url-stale', landed_on: c.url, signal: c.hit || 'a password field on a login-looking URL' },
+              hint: wall.auth_wall
+                ? `The site is asking for authentication (${wall.evidence}) before the flow can start. Sign in once in the browser, then replay. The flow itself does not need re-recording.`
+                : 'The recorded starting URL led to a sign-in or expired-session page rather than the flow. Its session token has gone stale. Sign in, then replay with start_url:false from the right page, or re-record the flow.',
             };
           }
         } catch { /* the check is advisory */ }
@@ -4464,6 +4545,11 @@ async function dispatchCore(port, method, params) {
             }
           }
           if (!res?.found) {
+            const wall = await detectAuthWall((await getSessionTab(port)).id);
+            if (wall.auth_wall) {
+              diverged = { step: i, method: step.method, reason: 'auth-wall', evidence: wall.evidence, url: wall.url };
+              break;
+            }
             if (step.optional) {
               results.push({ step: i, method: step.method, ok: true, skipped: 'condition not present' });
               continue;
@@ -4516,6 +4602,11 @@ async function dispatchCore(port, method, params) {
         const failed = out && typeof out === 'object' && (out.ok === false || out.found === false);
         const wrongOutcome = step.expect?.outcome && out?.outcome && out.outcome !== step.expect.outcome;
         if (failed || wrongOutcome) {
+          const wall = await detectAuthWall((await getSessionTab(port)).id).catch(() => ({ auth_wall: false }));
+          if (wall.auth_wall) {
+            diverged = { step: i, method: step.method, reason: 'auth-wall', evidence: wall.evidence, url: wall.url, actual: out };
+            break;
+          }
           diverged = {
             step: i, method: step.method,
             reason: wrongOutcome ? 'different-outcome' : 'step-failed',
