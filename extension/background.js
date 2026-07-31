@@ -5176,6 +5176,21 @@ async function dispatchCore(port, method, params) {
 
         await persist();
         let stopped = null, authWall = null, pausedForInterference = false;
+        let siteDegraded = null;
+        // Pacing. A run that trips a rate limit at 2am and then keeps going at full
+        // speed spends the next five hours making a struggling site worse and
+        // filling the ledger with failures that say nothing about the data. Waiting
+        // longer each time the site answers badly costs a good run nothing, because
+        // a good run never triggers it.
+        //
+        // Every part of this is reported. Backoff that quietly absorbs a site being
+        // down is worse than no backoff: the run still fails, and it takes hours
+        // longer to find out why.
+        const paceMs = Math.max(0, Math.min(60000, params.pace_ms || 0));
+        let backoffMs = 0, badStreak = 0;
+        const pacing = [];
+        const DEGRADED = /→ (429|5\d\d)$/;
+
         for (const entry of ledger.rows) {
           // submitted_unconfirmed is deliberately not retried. The flow ran to the
           // end, so the likeliest thing is that it worked and the page simply said
@@ -5202,6 +5217,11 @@ async function dispatchCore(port, method, params) {
             await persist();
             continue;
           }
+          // Jittered, so a run does not settle into a rhythm that looks like a
+          // script to anything watching, and so several runs do not synchronise.
+          const wait = backoffMs || paceMs;
+          if (wait) await new Promise(r2 => setTimeout(r2, Math.round(wait * (0.8 + Math.random() * 0.4))));
+
           entry.status = 'in_progress';
           entry.started_at = new Date().toISOString();
           await persist();
@@ -5216,6 +5236,70 @@ async function dispatchCore(port, method, params) {
             r = await dispatchCore(port, 'replay', { ...params, rows: undefined, resume: undefined, row: entry.row, verbose: false });
             kind = r.ok ? null : classify(r.diverged_at);
             if (kind === 'transient') kind = 'row-level';
+          }
+
+          // What the site said, rather than whether the row worked. A run can be
+          // completing rows perfectly while every request comes back 503, and by
+          // then it is filling a queue behind a wall.
+          // A form post navigates, so its status never reaches the page recorder —
+          // only fetch and XHR carry one. What it leaves behind is the server's
+          // own error page, which is the same thing said differently, so the page
+          // is asked as well as the requests.
+          let pageSaysDegraded = false;
+          try {
+            const dt = await getSessionTab(port);
+            const [d] = await chrome.scripting.executeScript({
+              target: { tabId: dt.id }, world: 'MAIN',
+              func: () => {
+                const title = (document.title || '').trim();
+                const h1 = (document.querySelector('h1')?.textContent || '').trim();
+                const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+                if (body.length > 1200) return false;
+                return /^\s*(429|5\d\d)\b/.test(title) || /^\s*(429|5\d\d)\b/.test(h1);
+              },
+            });
+            pageSaysDegraded = d?.result === true;
+          } catch {}
+
+          const sawBadStatus = r.site_degraded === true || pageSaysDegraded ||
+            (r.sent || []).some(s => DEGRADED.test(String(s))) ||
+            r.http_status >= 500 || r.http_status === 429;
+
+          // Once a site has started answering badly, its later failures stop
+          // looking like 5xx and start looking like anything else — a form that
+          // never loaded, a step whose target is missing. Treating each of those
+          // as a fresh unrelated problem is how a run talks itself into carrying
+          // on. Until a row goes through cleanly, a failure is still this.
+          const degraded = sawBadStatus || (backoffMs > 0 && !r.ok);
+          // A site returning 5xx does not mean the flow no longer matches it. The
+          // page is different because the site is broken, and calling that
+          // structural sends someone off to re-record a flow that is fine — while
+          // the real answer, that the site is having a bad time, is the thing the
+          // streak below is counting.
+          if (degraded && kind === 'structural') kind = 'row-level';
+
+          if (degraded) {
+            badStreak++;
+            backoffMs = Math.min(60000, backoffMs ? backoffMs * 2 : 2000);
+            pacing.push({ after_row: entry.index, waiting_ms: backoffMs, because: 'the site answered 429 or 5xx' });
+          } else if (backoffMs) {
+            // Recovered. Back to normal speed rather than staying slow for the
+            // rest of a long run.
+            pacing.push({ after_row: entry.index, waiting_ms: paceMs, because: 'the site answered normally again' });
+            backoffMs = 0; badStreak = 0;
+          } else {
+            badStreak = 0;
+          }
+
+          // Four in a row is a site with a problem, not a run with one. Stopping
+          // leaves the queue intact and says why; continuing turns one outage into
+          // several hundred failures that all have to be read.
+          if (badStreak >= 4) {
+            entry.status = entry.possibly_committed ? 'needs_review' : 'pending';
+            await persist();
+            siteDegraded = `the site has answered ${badStreak} rows in a row with 429 or a server error`;
+            stopped = entry;
+            break;
           }
 
           entry.at = new Date().toISOString();
@@ -5367,6 +5451,17 @@ async function dispatchCore(port, method, params) {
           flow: params.name,
           rows_total: ledger.rows.length,
           ...counts,
+          // Never silent. Backoff that quietly absorbs a site being down is worse
+          // than none, because the run fails anyway and it takes hours longer to
+          // find out why.
+          ...(pacing.length ? { paced: pacing.slice(-6) } : {}),
+          ...(siteDegraded ? {
+            paused_at_row: stopped?.index,
+            paused_for: 'the site',
+            reason: siteDegraded,
+            remaining: (counts.pending || 0),
+            hint: `The queue is intact and this row was left ready to run. Check whether the site is up and whether a rate limit was hit, then continue with browser_replay({name:"${params.name}", resume:"${runId}"}). Carrying on into a site answering like this turns one outage into a few hundred failures that all have to be read.`,
+          } : {}),
           // Said plainly rather than left in the counts. A run that reports two
           // hundred done and eleven unconfirmed is a different night from one that
           // reports two hundred and eleven done, and the difference is exactly the
@@ -5392,7 +5487,7 @@ async function dispatchCore(port, method, params) {
               ? `Leave the run's tab alone, then continue with browser_replay({name:"${params.name}", resume:"${runId}"}). The queue is intact and this row was left ready to run rather than counted as failed. Nothing about the flow is wrong. Carrying on regardless is the danger — every step after this would act on a page somebody else has changed.`
               : `Sign in once in the browser, then continue with browser_replay({name:"${params.name}", resume:"${runId}"}). The queue is intact and this row was left ready to run rather than counted as failed. Nothing about the flow is wrong, so it does not need re-recording. Tell the user now: an unattended run cannot get past this on its own.`,
           } : {}),
-          ...(stopped && !authWall ? {
+          ...(stopped && !authWall && !siteDegraded ? {
             paused_at_row: stopped.index,
             reason: 'structural divergence — the page no longer matches the recording, so the remaining rows would fail the same way',
             remaining: counts.pending || 0,
@@ -5411,6 +5506,7 @@ async function dispatchCore(port, method, params) {
       // moment can be attributed to a person rather than to us.
       const actedWindows = [];
       let interference = null;
+      let sawDegraded = false;
 
       if (params.start_url !== false && flow.start_url) {
         await dispatchCore(port, 'navigate', { url: flow.start_url }).catch(() => {});
@@ -5609,6 +5705,11 @@ async function dispatchCore(port, method, params) {
         // input that caused them, and a step's effects are still this step's.
         actedWindows.push([stepFrom - 200, Date.now() + 600]);
 
+        // How the site answered, as distinct from whether the step worked. A row
+        // can complete perfectly while every request behind it comes back 503, and
+        // the run above needs that to decide whether to keep going.
+        if ((out?.sent || []).some(s => /→ (429|5\d\d)$/.test(String(s)))) sawDegraded = true;
+
         // Asked after every step rather than once at the end. What the page
         // recorded is lost when it navigates, and most flows navigate part way
         // through — checking only at the end would miss anything that happened
@@ -5704,6 +5805,9 @@ async function dispatchCore(port, method, params) {
       return {
         ok: !diverged && (!validation || validation.would_submit !== false),
         flow: params.name,
+        // Carried up so a run of many rows can tell a site having a bad time from
+        // rows having a bad time. A single row cannot see the difference.
+        ...(sawDegraded ? { site_degraded: true } : {}),
         ...(dryRun ? {
           dry_run: true,
           committed: false,
