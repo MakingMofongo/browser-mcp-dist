@@ -171,6 +171,9 @@ async function releaseSession(port) {
   // Dropped with the session that produced it, so a long-lived worker does not
   // accumulate the history of every session that has ever connected.
   callLogs.delete(port);
+  // Whatever this session was holding goes with it. A credential outliving the
+  // session that copied it is exactly what this slot exists to avoid.
+  chrome.storage.session.remove(`bmcp_held_value_${port}`).catch(() => {});
   const session = sessions.get(port);
   if (!session) return;
 
@@ -4273,7 +4276,12 @@ async function dispatchCore(port, method, params) {
       const act = params.action || 'copy';
       const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
-      const SLOT = 'bmcp_held_value';
+      // Keyed by session. This slot exists to carry a credential between two
+      // pages without it entering the conversation, and more than one Claude
+      // session drives this extension at once — a single shared key means one
+      // session can paste what another is holding, or read its length and shape.
+      // Neither is something the caller could see going wrong.
+      const SLOT = `bmcp_held_value_${port}`;
       const held = async () => (await chrome.storage.session.get(SLOT))[SLOT] ?? null;
 
       if (act === 'copy') {
