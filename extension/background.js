@@ -5105,6 +5105,16 @@ async function dispatchCore(port, method, params) {
 
         const persist = async () => {
           const s2 = await chrome.storage.local.get({ bmcpRuns: {} });
+          // Evidence is kept for the rows most likely to be looked at. A run where
+          // hundreds of rows go wrong has a bigger problem than its forensics, and
+          // storage here is shared with the saved flows, which matter more.
+          const withEvidence = ledger.rows.filter(r => r.evidence);
+          if (withEvidence.length > 60) {
+            for (const r of withEvidence.slice(0, withEvidence.length - 60)) {
+              delete r.evidence;
+              r.evidence_dropped = 'kept for the 60 most recent rows that needed review';
+            }
+          }
           s2.bmcpRuns[runId] = { ...ledger, updated: new Date().toISOString() };
           // Keep the ledger bounded; oldest runs fall off.
           const keys = Object.keys(s2.bmcpRuns);
@@ -5240,6 +5250,62 @@ async function dispatchCore(port, method, params) {
             // hold back rows that plainly need re-running, and cry wolf on the flag
             // that exists to prevent duplicates.
             entry.possibly_committed = kind !== 'row-level' && postsSeen() > postsBefore;
+          }
+
+          // Kept for the rows somebody will have to look at, and only those. When
+          // forty of five hundred go sideways the questions are always the same —
+          // what was on screen, what the page was complaining about, what the form
+          // held at that moment, what went to the server — and every one of them is
+          // unanswerable an hour later once the tab has moved on. Text rather than
+          // screenshots: this is most of the forensic value at about a kilobyte a
+          // row, and a run does not quietly turn into a folder of images nobody
+          // prunes. Values are never stored, only whether each field still matched.
+          if (entry.status !== 'done') {
+            try {
+              const evTab = await getSessionTab(port);
+              const [ev] = await chrome.scripting.executeScript({
+                target: { tabId: evTab.id }, world: 'MAIN',
+                args: [[...(writtenValues.get(evTab.id)?.values() || [])].map(w => [w.selector, w.value])],
+                func: (pairs) => {
+                  const vis = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+                  };
+                  const errors = [...document.querySelectorAll('[role="alert"], [aria-invalid="true"], .error, .invalid-feedback, [class*="error" i]:not(input):not(select):not(form)')]
+                    .filter(vis).map(e => (e.textContent || '').replace(/\s+/g, ' ').trim())
+                    .filter(t => t && t.length < 200).slice(0, 6);
+                  const naming = (el, sel) => String(
+                    (el.labels && el.labels[0] ? el.labels[0].textContent : '') ||
+                    el.getAttribute('aria-label') || el.name || el.id || sel || ''
+                  ).replace(/\s+/g, ' ').trim().slice(0, 40);
+                  let fields = pairs.map(([sel, want]) => {
+                    let el = null;
+                    const rm = /^ref[_=](\d+)$/.exec(sel);
+                    if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+                    if (!el) { try { el = document.querySelector(sel); } catch (e) {} }
+                    if (!el) return { field: sel, state: 'gone' };
+                    const now = el.isContentEditable ? (el.textContent || '') : String(el.value ?? '');
+                    return { field: naming(el, sel), state: now === want ? 'as written' : (now.trim() ? 'different' : 'empty') };
+                  });
+                  // What this row wrote is forgotten the moment the page navigates,
+                  // and a row usually fails on the page after the submit. Describing
+                  // the form that is actually in front of us keeps the answer to
+                  // "what state was it left in" available either way. Still only
+                  // whether a field holds anything, never what.
+                  if (!fields.length) {
+                    fields = [...document.querySelectorAll('input, textarea, select')]
+                      .filter(el => el.type !== 'hidden' && vis(el))
+                      .slice(0, 12)
+                      .map(el => ({ field: naming(el, ''), state: String(el.value ?? '').trim() ? 'holds a value' : 'empty' }))
+                      .filter(f => f.field);
+                  }
+                  return { title: document.title, heading: (document.querySelector('h1,h2,h3')?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80), errors, fields };
+                },
+              });
+              if (ev?.result) {
+                entry.evidence = { url: r.url || evTab.url, ...ev.result, sent: r.sent || undefined, at: new Date().toISOString() };
+              }
+            } catch { /* evidence is a nice-to-have; never fail a row for it */ }
           }
           await persist();
 
@@ -5510,6 +5576,11 @@ async function dispatchCore(port, method, params) {
           const mutating = (fired || []).filter(q => MUTATING_VERB.test(q.method));
           if (mutating.length) out.sent = mutating.slice(0, 6).map(q => `${q.method} ${q.url}` + (q.status ? ` → ${q.status}` : ''));
         }
+        // Replayed steps bypass dispatch, so without this nothing records what the
+        // row wrote — and the two checks that exist for unattended runs both read
+        // from that record. The blank-save guard and the payload reconciliation
+        // were silently inert during exactly the runs they were built for.
+        await trackWrite(port, step.method, p, out);
         results.push({ step: i, method: step.method, ok: out?.ok !== false, value: p.value });
 
         // Escalate on divergence rather than ploughing on into a wrong page.
