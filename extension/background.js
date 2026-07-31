@@ -3411,6 +3411,21 @@ async function dispatchCore(port, method, params) {
         const el = await resolveElement(tab.id, params.selector);
         if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
 
+        // Something sitting over the target still receives a real click, so the
+        // action succeeds and the wrong thing happens. Checking what is actually
+        // at the point first is the difference between accepting a cookie banner
+        // and reporting that one is in the way.
+        const hit = await hitTest(tab.id, el.x, el.y, params.selector);
+        if (hit?.intercepted) {
+          return {
+            ok: false, verified: false, intercepted_by: hit.by,
+            error: `Something is covering "${params.selector}": the click at that point would land on ${hit.by}. Nothing was clicked.`,
+            hint: hit.dismissable
+              ? 'Looks like a consent banner or modal — browser_dismiss_overlays clears those, then click again.'
+              : 'Scroll it into a clear position, close whatever is on top, or use browser_click_xy with coordinates read from a screenshot.',
+          };
+        }
+
         // Primary path: debugger mouse events (isTrusted=true, works on React/Angular SPAs)
         const verdict = await debuggerClick(tab.id, el.x, el.y);
         if (!verdict.landed) {
@@ -6362,6 +6377,56 @@ async function dispatchCore(port, method, params) {
 }
 
 // ── CAPTCHA Detection & Solving Helpers ─────────────────────────────────────
+
+// Injected. Answers one question: if a click were sent to this point, would it
+// reach the element that was asked for, or something sitting over it?
+function bmcpHitTest(x, y, sel) {
+  const deepQ = (root, s) => {
+    let el = null;
+    try { el = root.querySelector(s); } catch (e) { return null; }
+    if (el) return el;
+    for (const n of root.querySelectorAll('*')) if (n.shadowRoot) { const f = deepQ(n.shadowRoot, s); if (f) return f; }
+    return null;
+  };
+  let want = null;
+  const rm = /^ref[_=](\d+)$/.exec(sel || '');
+  if (rm) want = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+  else if (sel && !/^text=|:text\(/.test(sel)) want = deepQ(document, sel);
+  if (!want || !want.isConnected) return { intercepted: false, reason: 'target not resolvable here' };
+
+  let at = document.elementFromPoint(x, y);
+  let host = at;
+  for (let i = 0; i < 20 && host && host.shadowRoot; i++) {
+    const inner = host.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === host) break;
+    at = inner; host = inner;
+  }
+  if (!at) return { intercepted: false, reason: 'nothing at that point' };
+  // A child, a parent, or the label bound to the control all mean the click
+  // lands where it was meant to. Only an unrelated node is an interception.
+  if (at === want || want.contains(at) || at.contains(want)) return { intercepted: false };
+  if (at.tagName === 'LABEL' && (at.control === want || at.htmlFor && at.htmlFor === want.id)) return { intercepted: false };
+
+  const name = (at.getAttribute && (at.getAttribute('aria-label') || at.getAttribute('title'))) ||
+    (at.innerText || at.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  const cs = getComputedStyle(at);
+  const box = at.getBoundingClientRect();
+  const covers = box.width * box.height > innerWidth * innerHeight * 0.25;
+  const fixed = cs.position === 'fixed' || cs.position === 'sticky';
+  const idish = ((at.id || '') + ' ' + (at.className && at.className.baseVal !== undefined ? at.className.baseVal : at.className || '')).toLowerCase();
+  const dismissable = /consent|cookie|banner|modal|overlay|backdrop|popup|dialog|gdpr|interstitial/.test(idish) ||
+    (at.getAttribute && at.getAttribute('role') === 'dialog') || (fixed && covers);
+  const desc = `<${at.tagName.toLowerCase()}>` + (name ? ` "${name}"` : '') +
+    (fixed ? ' (fixed position)' : '') + (covers ? ', covering much of the viewport' : '');
+  return { intercepted: true, by: desc, dismissable };
+}
+
+async function hitTest(tabId, x, y, selector) {
+  try {
+    const r = await safeExecuteScript(tabId, bmcpHitTest, [x, y, selector]);
+    return r?.result || null;
+  } catch { return null; }
+}
 
 // Injected. Reports which CAPTCHA is present and whether a challenge is actually
 // showing — a widget sitting idle on the page is not what blocked the flow, an
