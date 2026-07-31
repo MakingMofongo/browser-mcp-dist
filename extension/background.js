@@ -2091,6 +2091,22 @@ async function dismissOverlays(tabId, scope = 'non_critical', maxPasses = 3) {
         const hasTextFields = editableTextInputs.length > 0;
         const hasOnlyCheckboxRadios = !hasTextFields && allEditableInputs.length > 0;
 
+        // On plenty of portals the modal IS the workflow — it holds the form and the
+        // button that submits it. Closing that is not tidying up, it is discarding
+        // the step. Anything carrying a submit control is left alone unless the
+        // caller explicitly asked for aggressive.
+        const submitish = /^(submit|save|continue|next|apply|pay|confirm|send|finish|update|create|add|book|sign in|log in)\b/i;
+        const hasSubmit = !!overlay.querySelector('button[type="submit"], input[type="submit"]') ||
+          [...overlay.querySelectorAll('button, [role="button"], a.btn')].some(b => submitish.test((b.textContent || '').trim()));
+        if (s !== 'aggressive' && hasSubmit) {
+          skipped.push({
+            role,
+            reason: 'left alone: contains a submit control, so this dialog is probably the form itself',
+            hasTextFields,
+          });
+          continue;
+        }
+
         // Determine if ambiguous keywords (Skip/Cancel/Afvis) are allowed
         let allowAmbiguous;
         if (s === 'aggressive') {
@@ -2565,11 +2581,24 @@ function bmcpPageSignature() {
     .filter(vis).map(d => (d.getAttribute('aria-label') || d.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 90));
   const errors = [...document.querySelectorAll('[role="alert"], [aria-invalid="true"], .error, .invalid-feedback')]
     .filter(vis).map(e => (e.textContent || '').trim().replace(/\s+/g, ' ')).filter(t => t && t.length < 160);
+  // Toggling a checkbox, picking a radio or typing into a field changes nothing in
+  // the page text, so a text-only comparison reports "nothing happened" for actions
+  // that plainly did. Control state is part of what changed.
+  const fields = {};
+  let idx = 0;
+  for (const el of document.querySelectorAll('input, select, textarea')) {
+    const key = el.name || el.id || `${el.tagName}#${idx++}`;
+    const t = (el.type || '').toLowerCase();
+    if (t === 'checkbox' || t === 'radio') fields[key] = el.checked ? '1' : '0';
+    else if (t === 'password') fields[key] = String(el.value || '').length;
+    else fields[key] = String(el.value || '').slice(0, 60);
+  }
   return {
     url: location.href, title: document.title, lines,
     dialogs: [...new Set(dialogs)].filter(Boolean).slice(0, 5),
     errors: [...new Set(errors)].slice(0, 6),
     scrollY: Math.round(window.scrollY),
+    fields,
   };
 }
 
@@ -2597,8 +2626,78 @@ function diffSignature(a, b, max = 8) {
   if (newDialogs.length) out.dialogs_opened = newDialogs;
   const newErrors = b.errors.filter(e => !a.errors.includes(e));
   if (newErrors.length) out.errors_shown = newErrors;
+  const fa = a.fields || {}, fb = b.fields || {};
+  const changedFields = Object.keys(fb).filter(k => String(fa[k]) !== String(fb[k]));
+  if (changedFields.length) out.fields_changed = changedFields.slice(0, 10);
   if (!Object.keys(out).length) out.no_visible_change = true;
   return out;
+}
+
+// Vision, but only where text has already failed. A full-page image after every
+// step costs ~1.5k tokens and is mostly unchanged pixels; a crop around the element
+// that just misbehaved is the one case where pixels beat a description.
+async function captureAnomalyShot(tabId, selector) {
+  let rect = null;
+  if (selector) {
+    try {
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId }, world: 'MAIN', args: [selector],
+        func: (sel) => {
+          const rm = /^ref[_=](\d+)$/.exec(sel || '');
+          let el = null;
+          if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+          else { try { el = document.querySelector(sel); } catch (e) {} }
+          if (!el || !el.isConnected) return null;
+          const b = el.getBoundingClientRect();
+          return { x: b.x, y: b.y, w: b.width, h: b.height, vw: innerWidth, vh: innerHeight };
+        },
+      });
+      rect = r?.result || null;
+    } catch { /* fall through to viewport */ }
+  }
+  try {
+    await debuggerAttach(tabId);
+    const PAD = 60;
+    let clip;
+    if (rect && rect.w > 0 && rect.h > 0) {
+      const x = Math.max(0, rect.x - PAD);
+      const y = Math.max(0, rect.y - PAD);
+      clip = {
+        x, y,
+        width: Math.min(rect.vw - x, rect.w + PAD * 2),
+        height: Math.min(rect.vh - y, rect.h + PAD * 2),
+        scale: 0.6,
+      };
+    } else {
+      const [vp] = await chrome.scripting.executeScript({
+        target: { tabId }, world: 'MAIN', func: () => ({ vw: innerWidth, vh: innerHeight }),
+      }).catch(() => [null]);
+      const v = vp?.result || { vw: 1280, vh: 800 };
+      clip = { x: 0, y: 0, width: v.vw, height: Math.min(v.vh, 900), scale: 0.4 };
+    }
+    const shot = await cdpSend(tabId, 'Page.captureScreenshot', {
+      format: 'jpeg', quality: 55, clip, captureBeyondViewport: false,
+    });
+    if (!shot?.data) return null;
+    return {
+      data: 'data:image/jpeg;base64,' + shot.data,
+      region: { x: Math.round(clip.x), y: Math.round(clip.y), width: Math.round(clip.width), height: Math.round(clip.height) },
+      scale: clip.scale,
+      cropped_to_element: !!(rect && rect.w > 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isAnomalous(result) {
+  if (!result || typeof result !== 'object') return null;
+  if (result.ok === false) return 'action reported failure';
+  if (result.verified === false) return 'no event reached the page';
+  if (result.outcome === 'no_change') return 'submit produced no change';
+  if (result.found === false) return 'element or text not found';
+  if (result.changed && result.changed.no_visible_change) return 'nothing on the page changed';
+  return null;
 }
 
 const OBSERVABLE = new Set([
@@ -2651,6 +2750,23 @@ async function dispatch(port, method, params) {
 }
 
 async function dispatchInner(port, method, params) {
+  const wantsShot = params && (params.screenshot === 'anomaly' || params.screenshot === 'always');
+  if (wantsShot && OBSERVABLE.has(method)) {
+    const result = await dispatchObserved(port, method, params);
+    const why = params.screenshot === 'always' ? 'requested' : isAnomalous(result);
+    if (why && result && typeof result === 'object') {
+      try {
+        const tab = await getSessionTab(port);
+        const shot = await captureAnomalyShot(tab.id, params.selector);
+        if (shot) result.screenshot = { ...shot, reason: why };
+      } catch { /* an image is a nice-to-have; never fail the action for it */ }
+    }
+    return result;
+  }
+  return dispatchObserved(port, method, params);
+}
+
+async function dispatchObserved(port, method, params) {
   if (!params || !params.observe || !OBSERVABLE.has(method)) {
     return dispatchCore(port, method, params);
   }
@@ -2767,7 +2883,15 @@ async function dispatchCore(port, method, params) {
             // Require the candidate to hold a meaningful share of page text
             return (best && bestLen > 400) ? best : document.body;
           };
-          const root = pickRoot().cloneNode(true);
+          const picked = pickRoot();
+          // Readability-style extraction assumes a document. On a dashboard there is
+          // no article to find, so it returns navigation and widget labels dressed up
+          // as content. Compare what was kept against the whole page and against how
+          // interactive the page is, and say when the result should not be trusted.
+          const fullLen = (document.body.innerText || '').length;
+          const controls = document.querySelectorAll('button, input, select, a[href]').length;
+          const usedBody = picked === document.body;
+          const root = picked.cloneNode(true);
           const STRIP = 'nav, header, footer, aside, script, style, noscript, iframe, form, ' +
             '[role="navigation"], [role="banner"], [role="contentinfo"], [role="complementary"], ' +
             '[role="dialog"], [aria-hidden="true"], [class*="cookie" i], [class*="sidebar" i], ' +
@@ -2778,7 +2902,19 @@ async function dispatchCore(port, method, params) {
             .replace(/[ \t]+/g, ' ')
             .replace(/\n{3,}/g, '\n\n')
             .trim();
-          return text;
+          const density = fullLen ? controls / (fullLen / 1000) : 0; // controls per 1k chars
+          const low = usedBody || density > 12 || text.length < 250;
+          return {
+            text,
+            confidence: low ? 'low' : 'high',
+            ...(low ? {
+              reason: usedBody
+                ? 'no article container found, so this is the whole body with boilerplate stripped'
+                : density > 12
+                ? 'the page is control-dense and reads like an application rather than a document'
+                : 'very little text survived extraction',
+            } : {}),
+          };
         },
       });
       } catch (e) {
@@ -2793,13 +2929,22 @@ async function dispatchCore(port, method, params) {
         }
         throw e;
       }
-      let content = res?.result ?? '';
+      // article mode returns a shape; text and html return a plain string.
+      const raw = res?.result;
+      let articleMeta = null;
+      let content = '';
+      if (raw && typeof raw === 'object' && typeof raw.text === 'string') {
+        content = raw.text;
+        articleMeta = { confidence: raw.confidence, ...(raw.reason ? { confidence_reason: raw.reason } : {}) };
+      } else {
+        content = raw ?? '';
+      }
       const fullLength = content.length;
       if (content.length > maxChars) {
         content = content.slice(0, maxChars) +
           `\n\n[TRUNCATED: showing ${maxChars} of ${fullLength} chars — pass max_chars for more, or format:"article" to strip boilerplate]`;
       }
-      return { content, url: tab.url, title: tab.title, length: fullLength, format };
+      return { content, url: tab.url, title: tab.title, length: fullLength, format, ...(articleMeta || {}) };
     }
 
     case 'screenshot': {
@@ -2881,18 +3026,23 @@ async function dispatchCore(port, method, params) {
       const replFunc = (codeStr) => {
         const asErr = (e) => ({ __scriptingError: true, message: String(e?.message || e), name: e?.name });
         // Under `require-trusted-types-for 'script'` (Gmail, Workspace, banks) the
-        // Function constructor rejects plain strings. Route the source through a
-        // pass-through policy so the same code is legal on hardened pages.
-        try {
-          if (window.trustedTypes && window.trustedTypes.createPolicy) {
-            if (!window.__bmcpTT) {
-              window.__bmcpTT = window.trustedTypes.createPolicy('bmcp-exec', {
-                createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s,
-              });
+        // Function constructor rejects plain strings. Wrap only at the point of
+        // construction: the policy returns a TrustedScript object, and applying it
+        // to codeStr itself broke every string operation performed on the source.
+        const trust = (src) => {
+          try {
+            if (window.trustedTypes && window.trustedTypes.createPolicy) {
+              if (!window.__bmcpTT) {
+                window.__bmcpTT = window.trustedTypes.createPolicy('bmcp-exec', {
+                  createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s,
+                });
+              }
+              if (window.__bmcpTT && window.__bmcpTT.createScript) return window.__bmcpTT.createScript(src);
             }
-            if (window.__bmcpTT && window.__bmcpTT.createScript) codeStr = window.__bmcpTT.createScript(codeStr);
-          }
-        } catch (e) { /* policy blocked; fall through and let the debugger path handle it */ }
+          } catch (e) { /* policy blocked; the debugger path still works */ }
+          return src;
+        };
+        const mkFn = (src) => new Function(trust(src));
         const tryEval = (build) => {
           const fn = build();
           const v = fn();
@@ -2913,24 +3063,24 @@ async function dispatchCore(port, method, params) {
           return parts.join(';') + ';\nreturn (' + tail + '\n);';
         };
         try {
-          return tryEval(() => new Function('return (' + codeStr + '\n)'));
+          return tryEval(() => mkFn('return (' + codeStr + '\n)'));
         } catch (e1) {
           if (e1?.name !== 'SyntaxError') return asErr(e1);
           try {
             // Await-containing single EXPRESSION ("await fetch(...)"): wrap so the
             // awaited value is RETURNED, not discarded as a statement.
-            return tryEval(() => new Function('return (async () => { return (' + codeStr + '\n); })()'));
+            return tryEval(() => mkFn('return (async () => { return (' + codeStr + '\n); })()'));
           } catch (e1b) {
             if (e1b?.name !== 'SyntaxError') return asErr(e1b);
             const rewritten = withLastExprReturn();
             if (rewritten != null) {
               try {
-                return tryEval(() => new Function('return (async () => {\n' + rewritten + '\n})()'));
+                return tryEval(() => mkFn('return (async () => {\n' + rewritten + '\n})()'));
               } catch { /* fall through to plain body */ }
             }
             try {
               // Statement code / top-level return: async-body wrap
-              return tryEval(() => new Function('return (async () => {\n' + codeStr + '\n})()'));
+              return tryEval(() => mkFn('return (async () => {\n' + codeStr + '\n})()'));
             } catch (e2) {
               return asErr(e2);
             }
@@ -4537,9 +4687,24 @@ async function dispatchCore(port, method, params) {
             (!onlyErrors || l.type === 'error' || l.type === 'exception') &&
             (!re || re.test(l.text)));
           const total = out.length;
-          out = out.slice(-count);
-          if (clear) buf.length = 0;
-          return { logs: out, total_matched: total, captured_since_load: !!window.__mcpConsoleLogs };
+          // Development builds repeat the same warning hundreds of times and bury
+          // the one line that matters. Identical messages collapse to a single entry
+          // with a count, so the signal survives the noise.
+          const seen = new Map();
+          for (const l of out) {
+            const key = l.type + '|' + l.text;
+            if (seen.has(key)) { const e = seen.get(key); e.repeats = (e.repeats || 1) + 1; e.ts = l.ts; }
+            else seen.set(key, { ...l });
+          }
+          const collapsed = [...seen.values()];
+          const deduped = total - collapsed.length;
+          return {
+            logs: collapsed.slice(-count),
+            total_matched: total,
+            unique: collapsed.length,
+            ...(deduped > 0 ? { duplicates_collapsed: deduped } : {}),
+            captured_since_load: !!window.__mcpConsoleLogs,
+          };
         },
       });
       const r = res?.result || { logs: [], captured_since_load: false };
