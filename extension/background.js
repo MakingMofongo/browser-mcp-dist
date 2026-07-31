@@ -7494,13 +7494,25 @@ async function dispatchCore(port, method, params) {
             }
             return true;
           };
+          // A word can say what kind of thing to look for and also say which one.
+          // "search" is both, and taking it out of the query as soon as it is
+          // recognised as a role left "search input" with nothing to match on at
+          // all — so every input and every button on the page tied on the role
+          // bonus alone, and the answer was whichever came first. Role words are
+          // still used as selectors; they are only removed from the text when
+          // something else is left to match on.
           const hintSelectors = [];
-          tokens = tokens.filter(t => {
+          const hintTokens = new Set();
+          for (const t of tokens) {
             const hint = ROLE_HINTS[t.replace(/s$/, '')] || ROLE_HINTS[t];
-            if (hint) { hintSelectors.push(...hint); return false; }
-            return true;
-          });
-          const textQuery = tokens.join(' ');
+            if (hint) { hintSelectors.push(...hint); hintTokens.add(t); }
+          }
+          const contentTokens = tokens.filter(t => !hintTokens.has(t));
+          // Whole-phrase matching uses the words that carry meaning; per-word
+          // scoring below still sees every word, so "search" counts for
+          // "Search Wikipedia" even when it is also acting as a role hint.
+          const textQuery = (contentTokens.length ? contentTokens : tokens).join(' ');
+          if (contentTokens.length) tokens = contentTokens;
           const CANDIDATES = 'a[href], button, input, select, textarea, summary, label, img[alt], ' +
             'h1, h2, h3, h4, h5, h6, [role], [onclick], [contenteditable="true"], [aria-label], [tabindex]:not([tabindex="-1"])';
           const collect = (root, out) => {
