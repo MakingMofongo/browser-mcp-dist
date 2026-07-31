@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Agent360 Browser MCP",
-  "version": "2.4.23",
+  "version": "2.4.24",
   "description": "Control your real Chrome from Claude Code — navigate, click, fill, screenshot, batch, refs, find, record and replay. 54 tools, multi-session, multi-browser.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1bSUmFoAkwMQMGnoTDB0fKwWHKWCaXFgSwcb6j9HEh2+14dy7OuBX2Tw+2K2D7RnN1IZKZJPezhfVZfwFXGwLq07JC8R1Zg12nmY9WjeeJDOEfrijb0UOJ5UnnspGM9zK5xLq8Cg9MyhYDjBfu5ccRUOuWZKxlDv8Cm3D4yEs9r2Kk51IdbBR35MRFcQQKKiOF0Ree7uqG0n/p9MfYdYpbfJ8FxZhGjOULoUPDYIY9dxnpP+BjCsLXCUaUUyFs4I5opIVnBIeWW3h5WJAOIa/AUmQV2fIsEnt0nkXYQBY49qjzCWORFlUPlkypMs9zBW4RFZUUjANN4yEWvT/0IUgQIDAQAB",
   "update_url": "https://makingmofongo.github.io/browser-mcp-dist/updates.xml",

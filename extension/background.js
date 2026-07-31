@@ -3091,6 +3091,16 @@ async function dispatchCore(port, method, params) {
         return { ok: true, went: nav, title: t.title, url: t.url, tab_id: t.id };
       }
 
+      // Chrome keeps the requested URL on the tab even when the load failed, so
+      // tabs.get afterwards reports the address that was asked for and a title
+      // derived from it. Catching the failure as it happens is the only way to
+      // tell "loaded" from "showing an error page that looks like it loaded".
+      let navError = null;
+      const errListener = (details) => {
+        if (details.tabId === tab.id && details.frameId === 0) navError = details.error;
+      };
+      try { chrome.webNavigation.onErrorOccurred.addListener(errListener); } catch {}
+
       // Always reuse the active tab — navigate in place, don't create new tabs
       // Only create new tab if explicitly requested via new_tab param
       if (params.new_tab) {
@@ -3115,15 +3125,58 @@ async function dispatchCore(port, method, params) {
       // Set as active tab for this session
       session.activeTabId = tab.id;
       persistSessions();
+      try { chrome.webNavigation.onErrorOccurred.removeListener(errListener); } catch {}
       const updated = await chrome.tabs.get(tab.id);
 
-      // Check for CAPTCHA after navigation
-      const captcha = await detectCaptcha(tab.id);
-      const result = { title: updated.title, url: updated.url, tab_id: tab.id, session: session.label };
-      if (captcha && captcha.found) {
-        result.captcha_detected = captcha.types.join(', ');
-        result.hint = `CAPTCHA detected: ${captcha.types.join(', ')}. Use browser_solve_captcha to handle it.`;
+      // Ask the document where it thinks it is. A failed load leaves the tab on
+      // chrome-error://chromewebdata/ while tabs.get still reports the intended
+      // address, and every step after this one would then run against an error
+      // page and fail for reasons that have nothing to do with the step.
+      let landedOn = null;
+      try {
+        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => location.href });
+        landedOn = r?.result || null;
+      } catch { /* injection refused — the error-page check below still applies */ }
+      // Ending on about:blank when a real address was asked for means the load
+      // was abandoned — reporting that as success sends the caller off to read
+      // an empty document.
+      const blanked = landedOn === 'about:blank' && !/^about:blank/i.test(String(params.url || ''));
+      const failed = navError || blanked || (landedOn && landedOn.startsWith('chrome-error://'));
+      if (failed) {
+        const why = {
+          'net::ERR_NAME_NOT_RESOLVED': 'the host name does not resolve',
+          'net::ERR_CONNECTION_REFUSED': 'the server refused the connection',
+          'net::ERR_CONNECTION_TIMED_OUT': 'the server did not answer in time',
+          'net::ERR_INTERNET_DISCONNECTED': 'there is no network connection',
+          'net::ERR_CERT_AUTHORITY_INVALID': 'the certificate is not trusted',
+          'net::ERR_CERT_COMMON_NAME_INVALID': 'the certificate does not match the host',
+          'net::ERR_SSL_PROTOCOL_ERROR': 'the TLS handshake failed',
+        }[navError] || (navError ? navError.replace(/^net::/, '')
+                                 : blanked ? 'the tab was left blank, so the load was abandoned'
+                                 : 'the page did not load');
+        return {
+          ok: false, url: params.url, tab_id: tab.id, session: session.label,
+          error: `The page did not load — ${why}. The tab is showing Chrome's error page, so anything done next would act on that rather than on the site.`,
+          ...(navError ? { chrome_error: navError } : {}),
+        };
       }
+
+      const result = { ok: true, title: updated.title, url: landedOn || updated.url, tab_id: tab.id, session: session.label };
+      // A redirect somewhere other than where the caller asked is worth saying
+      // plainly — most often it is a sign-in wall standing in front of the page.
+      if (landedOn && landedOn !== params.url) {
+        try {
+          const a = new URL(landedOn), b = new URL(params.url);
+          if (a.host !== b.host) result.redirected_to = a.host;
+        } catch {}
+      }
+      try {
+        const [c] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: bmcpDetectCaptchaLight });
+        if (c?.result?.found) {
+          result.captcha = c.result;
+          result.hint = `A CAPTCHA is on this page (${c.result.types.join(', ')}). It cannot be solved from here — tell the user and let them clear it in the browser.`;
+        }
+      } catch {}
       return result;
     }
 
