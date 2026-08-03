@@ -12,6 +12,39 @@ const BASE_PORT = 9876;
 const MAX_PORT = 9895;
 const connections = new Map(); // port → WebSocket
 
+/**
+ * Send, and say whether it went.
+ *
+ * try/catch around ws.send() does not do what it looks like it does. Sending on a
+ * CLOSING or CLOSED socket does not throw — the data is discarded and Chrome logs
+ * "WebSocket is already in CLOSING or CLOSED state" from inside its own
+ * implementation, where no catch can reach it. Only CONNECTING throws. So every
+ * guarded send in this file was catching the one case that cannot happen while
+ * quietly dropping the one that does.
+ *
+ * For a ping that hardly matters. For a command result it matters a great deal: the
+ * reply disappears, the server hears nothing, and the caller waits out its full
+ * timeout for an answer that was already computed and thrown away.
+ */
+function socketState(ws) {
+  if (!ws) return 'missing';
+  return ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState] || String(ws.readyState);
+}
+
+function sendJson(ws, obj, what) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.warn(`[Offscreen] dropped ${what}: socket is ${socketState(ws)}`);
+    return false;
+  }
+  try {
+    ws.send(JSON.stringify(obj));
+    return true;
+  } catch (e) {
+    console.warn(`[Offscreen] could not send ${what}: ${e?.message || e}`);
+    return false;
+  }
+}
+
 // Stable identity for this browser installation. IMPORTANT: offscreen documents
 // can only use chrome.runtime APIs — chrome.storage is NOT available here, so the
 // persisted id/label come from the service worker via message. Everything has a
@@ -83,7 +116,7 @@ function heartbeat() {
       continue;
     }
     try {
-      ws.send(JSON.stringify({ type: 'ping' }));
+      if (!sendJson(ws, { type: 'ping' }, 'heartbeat ping')) continue;
       h.unanswered = (h.unanswered || 0) + 1;
       health.set(port, h);
     } catch {}
@@ -123,11 +156,9 @@ function tryConnect(port) {
     // 2) upgraded hello once the persisted identity arrives from the SW.
     const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || 'unknown';
     const chromeVer = (navigator.userAgent.match(/Chrome\/([\d.]+)/) || [])[1] || '?';
-    try {
-      ws.send(JSON.stringify({ type: 'hello', instance: { id: 'pending', label: `Chrome on ${platform}`, platform, chrome_version: chromeVer } }));
-    } catch {}
+    sendJson(ws, { type: 'hello', instance: { id: 'pending', label: `Chrome on ${platform}`, platform, chrome_version: chromeVer } }, 'opening hello');
     getInstanceInfo()
-      .then(instance => { try { ws.send(JSON.stringify({ type: 'hello', instance })); } catch {} })
+      .then(instance => { sendJson(ws, { type: 'hello', instance }, 'identity hello'); })
       .catch(() => {});
     updateStatus();
   };
@@ -149,7 +180,7 @@ function tryConnect(port) {
     // The server checks this end the same way this end checks the server. Not
     // answering would have it hang up on a connection that was working perfectly.
     if (cmd.type === 'ping') {
-      try { ws.send(JSON.stringify({ type: 'pong' })); } catch {}
+      sendJson(ws, { type: 'pong' }, 'pong');
       return;
     }
     const { id, method, params } = cmd;
@@ -164,12 +195,12 @@ function tryConnect(port) {
       });
 
       if (result && result.__error) {
-        ws.send(JSON.stringify({ id, error: result.__error }));
+        sendJson(ws, { id, error: result.__error }, `error reply for command ${id}`);
       } else {
-        ws.send(JSON.stringify({ id, result }));
+        sendJson(ws, { id, result }, `result for command ${id}`);
       }
     } catch (err) {
-      ws.send(JSON.stringify({ id, error: err.message || String(err) }));
+      sendJson(ws, { id, error: err.message || String(err) }, `error reply for command ${id}`);
     }
   };
 
@@ -210,6 +241,47 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
+// Read a local file on the service worker's behalf.
+//
+// An MV3 service worker cannot fetch a file:// URL at all, even when the extension
+// has been granted access to file URLs — the scheme is simply unavailable there. An
+// offscreen document is an ordinary extension page, where the grant does apply, so
+// the read happens here and the bytes go back as base64.
+//
+// This exists so a file can be attached to an upload field when the Chrome debugger
+// is held by another client, which is the usual state on a machine running more than
+// one automation extension.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type !== 'bmcp_read_file' || typeof msg.url !== 'string') return;
+  (async () => {
+    try {
+      // XMLHttpRequest, not fetch. The Fetch API does not support the file: scheme in
+      // any Chrome context and rejects with a bare "Failed to fetch", which reads as a
+      // permissions problem and is not one — file access was granted and it still
+      // failed. XHR does support it, given that grant.
+      const buf = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', msg.url, true);
+        xhr.responseType = 'arraybuffer';
+        xhr.onload = () => (xhr.status === 0 || (xhr.status >= 200 && xhr.status < 300))
+          ? resolve(xhr.response)
+          : reject(new Error(`HTTP ${xhr.status}`));
+        xhr.onerror = () => reject(new Error('could not be read — check that "Allow access to file URLs" is on for this extension'));
+        xhr.send();
+      });
+      const bytes = new Uint8Array(buf);
+      // Chunked: String.fromCharCode over a whole multi-megabyte file overflows the
+      // argument stack, which would fail on exactly the large documents this is for.
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+      sendResponse({ ok: true, b64: btoa(binary), bytes: bytes.length });
+    } catch (e) {
+      sendResponse({ ok: false, error: String(e?.message || e) });
+    }
+  })();
+  return true; // keeps the channel open for the async reply
+});
+
 // Listen for terminate signals from background.js (sent when last tab in a session closes)
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== 'terminate_mcp_session' || typeof msg.port !== 'number') return;
@@ -217,7 +289,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (!ws) return;
   try {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'terminate' }));
+      sendJson(ws, { type: 'terminate' }, 'terminate notice');
     }
   } catch {}
   try { ws.close(); } catch {}

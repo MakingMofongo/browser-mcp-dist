@@ -225,14 +225,23 @@ async function getSessionTab(port) {
   let blankFallback = null;
   const consider = (tab) => {
     if (!tab) return false;
-    if (tab.url.startsWith('chrome://')) return false;
+    // Chrome reports an empty url for a tab that is still committing a navigation,
+    // and pendingUrl is where the destination lives until it does. An empty string
+    // passes every test below, so a tab caught mid-navigation was adopted on the
+    // strength of knowing nothing about it — which is how a session ended up holding
+    // another extension's page and failing every action with an attach error that
+    // read like debugger contention. Not knowing what a tab is has to disqualify it,
+    // the same as knowing it is unusable.
+    const url = tab.url || tab.pendingUrl || '';
+    if (!url) return false;
+    if (url.startsWith('chrome://')) return false;
     // A page belonging to an extension — ours or anyone's — cannot be driven:
     // Chrome refuses to attach a debugger to another extension's page, and every
     // action on it fails with an attach error that reads like debugger contention
     // rather than what it is. Picking one is how a session ends up unable to do
     // anything while looking like it has a perfectly good tab.
-    if (tab.url.startsWith('chrome-extension://') || tab.url.startsWith('edge://') || tab.url.startsWith('devtools://')) return false;
-    if (tab.url.startsWith('about:')) { if (!blankFallback) blankFallback = tab; return false; }
+    if (url.startsWith('chrome-extension://') || url.startsWith('edge://') || url.startsWith('devtools://')) return false;
+    if (url.startsWith('about:')) { if (!blankFallback) blankFallback = tab; return false; }
     return true;
   };
 
@@ -326,7 +335,75 @@ async function verifyAttachedWithChrome(tabId, attempts = 4) {
   return false;
 }
 
+// Set by reattach_debugger({disable:true}) so the contested-slot path can be tested
+// on demand instead of waiting for another extension to cause it. Restored from
+// session storage because a service worker is evicted between calls and would
+// otherwise forget it mid-test.
+let pretendNoDebugger = false;
+// The other half: calls that never return, rather than calls that fail. Set by
+// reattach_debugger({wedge:true}) so health's deadlines can be exercised on demand.
+let pretendWedged = false;
+chrome.storage.session.get(['bmcpPretendNoDebugger', 'bmcpPretendWedged'])
+  .then((r) => {
+    if (r?.bmcpPretendNoDebugger) pretendNoDebugger = true;
+    if (r?.bmcpPretendWedged) pretendWedged = true;
+  })
+  .catch(() => {});
+
+/**
+ * Attach files to a file input without CDP.
+ *
+ * Reads the bytes here — the only part that needs privilege — and hands them to the
+ * page, where a DataTransfer can be assigned to input.files. Reading a local path
+ * requires "Allow access to file URLs" to be switched on for this extension, which is
+ * off by default; when it is off this says so and where to change it, because a
+ * generic failure here is indistinguishable from the file simply not attaching.
+ */
+async function uploadWithoutDebugger(tabId, selector, files, filesB64) {
+  if (!files.length && !filesB64?.length) return { ok: false, error: 'No files given.' };
+
+  // The server reads the bytes and sends them, because nothing inside the browser
+  // can. A service worker cannot fetch the file: scheme at all; an offscreen document
+  // cannot either, even with "Allow access to file URLs" granted — which was verified
+  // here, reported as on, and still refused the read. The only in-browser route left
+  // needs a tab pointed at the file, which is worse than asking the process that
+  // already has the path.
+  const parts = (filesB64 || []).map((f) => ({ name: f.name, b64: f.b64, type: '' }));
+  if (!parts.length) {
+    return {
+      ok: false,
+      error: 'Cannot attach a file: the debugger is held by another client, and no file contents were supplied with the request.',
+      hint: 'The MCP server normally reads the files and sends their contents. This path was reached without them, which means the call did not come through it.',
+    };
+  }
+
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN', func: bmcpAttachFiles, args: [selector, parts],
+  });
+  const r = res?.result;
+  if (!r?.found) return { ok: false, error: `File input not found: ${selector}` };
+  if (r.wrong_kind) return { ok: false, error: `${selector} is a ${r.wrong_kind}, not a file input.` };
+  if (!r.count) return { ok: false, error: 'The files were set but the input reports none attached.' };
+  return {
+    ok: true, files: r.names, count: r.count, verified: true, path: 'page',
+    note: 'Attached from the page because the debugger was unavailable.',
+  };
+}
+
 async function debuggerAttach(tabId) {
+  if (pretendNoDebugger) {
+    // Behaves like a contested slot; does not pretend to be Chrome's message. Copying
+    // that string verbatim made the simulation faithful to the one thing about the
+    // real failure worth changing — it says nothing a caller can act on, and it sent
+    // three investigations after the tab rather than the debugger. What a tool
+    // surfaces from here should be readable by whoever hits it.
+    throw new Error(
+      'Debugger attach failed: the debugger is switched off for this session ' +
+      '(browser_reattach_debugger with disable:true). Chrome allows one debugger client ' +
+      'per tab, so this is the same state as another extension holding it. ' +
+      'Call browser_reattach_debugger with disable:false to restore it.'
+    );
+  }
   // First check local cache — fast path
   if (debuggerAttached.has(tabId)) {
     // Verify with Chrome before trusting cache (cheap, ~1ms)
@@ -386,8 +463,44 @@ async function debuggerAttach(tabId) {
     if (attempt >= 1) { try { await chrome.debugger.detach({ tabId }); } catch {} }
     if (attempt < 5) await new Promise(r => setTimeout(r, 200 + attempt * 300));
   }
+  // What the tab actually is, not just its number. This error named a tab id and a
+  // Chrome message, and the message "cannot access a chrome-extension:// URL of
+  // different extension" does not say WHICH page — so working out how a session
+  // came to be pointed at one meant guessing, twice, wrongly. The URL is the whole
+  // answer and it was one call away.
+  // Placed before the Chrome message rather than after it. Every layer that prints
+  // an error truncates it somewhere, and the first version of this put the URL at
+  // the end — where it was cut off by the very log that needed it, leaving the same
+  // unanswerable message as before. What identifies the problem goes first.
+  let what = '';
+  try {
+    const t = await chrome.tabs.get(tabId);
+    what = `${t.url || t.pendingUrl || '(no readable url)'}${t.title ? ` "${t.title}"` : ''}`;
+  } catch { what = 'tab no longer exists'; }
+
+  // Name the extension when that is what this is about. The message "cannot access
+  // a chrome-extension:// URL of different extension" reads as though the TAB were
+  // an extension page, and it sent two separate investigations after the tab — which
+  // turned out to be an ordinary http page every time. What Chrome means is that
+  // attaching to a tab attaches to its frames, and another extension has injected
+  // one. That is a fact about which extension is installed, and it is enumerable.
+  // Only what is actually known. The first version of this listed every
+  // chrome-extension:// debug target it could see and called them "in the way",
+  // which named four innocent extensions — a password manager and a page monitor
+  // among them — none of which hold the debugger or even ask for the permission.
+  // Every extension has a service-worker target; that is not evidence of anything.
+  // What the tab's own target says about being attached is.
+  let culprits = '';
+  if (/different extension|Cannot access a chrome-extension/i.test(lastMsg)) {
+    try {
+      const target = (await chrome.debugger.getTargets()).find((t) => t.tabId === tabId);
+      culprits = target?.attached
+        ? ' Chrome reports this tab already has a debugger client, which is not us — only one is allowed at a time.'
+        : ' Chrome does not report another client on this tab, so this is not ordinary contention.';
+    } catch {}
+  }
   throw new Error(
-    `Debugger attach failed after 6 force-grab attempts (tab ${tabId}). Last: ${lastMsg}. ` +
+    `Debugger attach failed: tab ${tabId} is at ${what}. Chrome said: ${lastMsg}.${culprits} ` +
     `Chrome allows ONE debugger client per tab — check for another automation extension ` +
     `(e.g. Claude in Chrome) or an open DevTools window on this tab, then call browser_reattach_debugger. ` +
     `Note: interactive tools still work via the synthetic fallback; only isTrusted=true is lost.`
@@ -430,11 +543,66 @@ const NET_MAX = 300;
 const NET_BODY_MAX = 200_000;      // per response
 const NET_BODY_BUDGET = 4_000_000; // per tab, so a chatty page cannot grow without bound
 
+// A fingerprint of the source actually running, as opposed to the version it calls
+// itself. Editing a file and copying it into place changes nothing in Chrome until
+// the extension is reloaded, so a test run after a sync-without-reload exercises the
+// old code and passes or fails for reasons that have nothing to do with the edit.
+// That happened twice in one evening here and cost two wrong diagnoses, because
+// nothing anywhere compared what was running against what was on disk. The version
+// number cannot answer this — it only moves on release, not on every edit.
+const FINGERPRINT_FILES = [
+  'manifest.json', 'background.js', 'console-capture.js',
+  'offscreen.js', 'heartbeat-policy.js', 'popup.js',
+];
+let sourceFingerprint = null;
+async function computeFingerprint() {
+  if (sourceFingerprint) return sourceFingerprint;
+  const hex = (buf, n) => [...new Uint8Array(buf)].slice(0, n).map(b => b.toString(16).padStart(2, '0')).join('');
+  const sha = async (s) => crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  const parts = [];
+  for (const f of FINGERPRINT_FILES) {
+    try {
+      const text = await (await fetch(chrome.runtime.getURL(f))).text();
+      parts.push(`${f}:${text.length}:${hex(await sha(text), 4)}`);
+    } catch {
+      parts.push(`${f}:absent`);
+    }
+  }
+  sourceFingerprint = hex(await sha(parts.join('|')), 8);
+  return sourceFingerprint;
+}
+
 function netBodyBytes(tabId) {
   const buf = networkLogs.get(tabId) || [];
   let n = 0;
   for (const e of buf) n += e.body ? e.body.length : 0;
   return n;
+}
+
+// Make room for a body that is about to be captured, by dropping the oldest ones.
+//
+// The budget used to be a hard stop: once a tab had accumulated its 4MB, capture
+// simply ceased for the life of that tab. That inverts what anyone wants — the
+// responses worth reading are the ones a caller has just triggered, and those were
+// exactly the ones being refused while bodies from ten minutes ago sat there
+// keeping them out. A long-lived session tab reaches this state quietly and then
+// never captures another body.
+//
+// The entries stay; only the bodies go, so the log still shows what was requested.
+function makeRoomForBody(tabId) {
+  const buf = networkLogs.get(tabId) || [];
+  let bytes = netBodyBytes(tabId);
+  if (bytes < NET_BODY_BUDGET) return 0;
+  let freed = 0;
+  for (const e of buf) { // oldest first
+    if (bytes < NET_BODY_BUDGET) break;
+    if (e.body == null) continue;
+    bytes -= e.body.length;
+    delete e.body; delete e.body_bytes; delete e.body_truncated;
+    e.body_note = 'body dropped to make room for newer responses; re-issue the request to read it';
+    freed++;
+  }
+  return freed;
 }
 
 function netBuf(tabId) {
@@ -459,7 +627,16 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     if (buf.length > NET_MAX) buf.splice(0, buf.length - NET_MAX);
   } else if (method === 'Network.responseReceived') {
     const e = buf.find(x => x.id === params.requestId);
-    if (e) { e.status = params.response?.status; e.mime = params.response?.mimeType; }
+    if (e) {
+      e.status = params.response?.status;
+      e.mime = params.response?.mimeType;
+      // The authoritative resource type. The one on requestWillBeSent is optional in
+      // the protocol and is sent before any response exists; when it is absent, a
+      // fetch returning HTML looks like a plain document to the body-capture rule
+      // below and its body is skipped, leaving an entry indistinguishable from a
+      // response that had none.
+      if (params.type) e.type = params.type;
+    }
   } else if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
     const e = buf.find(x => x.id === params.requestId);
     if (e) {
@@ -472,7 +649,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       // the page already fetched. Bodies are held but only returned on request.
       const isData = e.type === 'XHR' || e.type === 'Fetch' ||
         (e.mime && /json|javascript|text\/plain|xml/i.test(e.mime));
-      if (method === 'Network.loadingFinished' && isData && netBodyBytes(tabId) < NET_BODY_BUDGET) {
+      if (method === 'Network.loadingFinished' && isData) {
+        makeRoomForBody(tabId);
         chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId: params.requestId })
           .then((r) => {
             if (!r || r.body == null) return;
@@ -481,8 +659,16 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
             e.body_bytes = s.length;
             e.body = s.length > NET_BODY_MAX ? s.slice(0, NET_BODY_MAX) : s;
             if (s.length > NET_BODY_MAX) e.body_truncated = s.length;
+            delete e.body_note; // an earlier eviction note no longer describes this entry
           })
-          .catch(() => { /* body already evicted from Chrome's cache */ });
+          // Says which failure it was. This was a bare catch on the assumption that
+          // the body had been evicted, and that assumption then stood in for every
+          // reason the call can fail — leaving an entry that looks exactly like a
+          // response that never had a body. It cost a release gate and two wrong
+          // diagnoses before the error itself was ever read.
+          .catch((err) => {
+            e.body_note = `body not retrieved: ${String(err?.message || err).split('\n')[0]}`;
+          });
       }
     }
   }
@@ -842,6 +1028,38 @@ async function evalAttached(tabId, expression) {
 // a preceding CDP focus/click is swallowed they silently wipe the PREVIOUS field
 // (observed: filling password erased the already-filled username, and the form
 // submitted empty). Targeting the element directly cannot damage its neighbours.
+/**
+ * What actually ended up in the field, compared to what was asked for.
+ *
+ *   exact       — it is there
+ *   transformed — a mask or formatter rewrote it (phone, date, card). Still a success:
+ *                 the field accepted the input and chose how to display it.
+ *   appended    — the old value is still there with the new one stuck on the end.
+ *                 This is the doubling bug, and it is the one worth naming.
+ *   wrong       — something else entirely, including empty.
+ *
+ * Length is used rather than exact text wherever possible because password fields
+ * report a length and never a value.
+ */
+function fillVerdict(after, expected) {
+  if (!after) return 'wrong';
+  const want = String(expected ?? '');
+  const len = after.len != null ? after.len : String(after.value ?? '').length;
+  if (want === '') return len === 0 ? 'exact' : 'wrong';
+  if (after.redacted || after.value == null) {
+    // Password field: length is all there is. Anything longer than asked for is the
+    // old contents still sitting there.
+    if (len === want.length) return 'exact';
+    return len > want.length ? 'appended' : 'wrong';
+  }
+  const got = String(after.value);
+  if (got === want) return 'exact';
+  if (got.length > want.length && got.includes(want)) return 'appended';
+  // A mask reformats without adding a whole extra copy: same order of magnitude.
+  if (got.length && Math.abs(got.length - want.length) <= Math.max(4, want.length * 0.5)) return 'transformed';
+  return 'wrong';
+}
+
 async function focusAndClearElement(tabId, selectorOrRef) {
   try {
     const [r] = await chrome.scripting.executeScript({
@@ -866,7 +1084,42 @@ async function focusAndClearElement(tabId, selectorOrRef) {
         return { ok: true, focused: document.activeElement === el };
       },
     });
-    return r?.result || { ok: false };
+    const cleared = r?.result || { ok: false };
+
+    // Check the field is actually empty, and clear it with real keys if it is not.
+    //
+    // Setting value to '' through the native setter and firing input is a request,
+    // not a result: a controlled input — Google's sign-in field, React, Salesforce
+    // LWC — puts its own value straight back on the next render. Nothing here
+    // noticed, so the insert that followed appended to the restored text. One field
+    // reached four stacked copies of an email address that way, and every fill
+    // along the way returned ok.
+    if (cleared.ok) {
+      const [check] = await chrome.scripting.executeScript({
+        target: { tabId }, world: 'MAIN', args: [selectorOrRef],
+        func: (sel) => {
+          let el = null;
+          if (sel && sel.startsWith('ref_')) el = window.__bmcpRefEls && window.__bmcpRefEls[sel];
+          else if (sel) { try { el = document.querySelector(sel); } catch {} }
+          if (!el || !el.isConnected) return { gone: true };
+          return { len: ('value' in el ? String(el.value || '') : String(el.textContent || '')).length };
+        },
+      });
+      const stillHas = check?.result && !check.result.gone && check.result.len > 0;
+      if (stillHas) {
+        // Real select-all + Delete. A framework that overrides the setter still has
+        // to honour keyboard editing, because that is what a person would do.
+        try {
+          await debuggerAttach(tabId);
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: SELECT_ALL_MODS });
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: SELECT_ALL_MODS });
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 });
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 });
+        } catch { /* reported below by whoever reads the field next */ }
+        cleared.needed_keys = true;
+      }
+    }
+    return cleared;
   } catch {
     return { ok: false };
   }
@@ -2207,18 +2460,24 @@ async function setDatePicker(tabId, selector, iso) {
     }, [dir]);
 
     if (!navClicked.result) {
-      await debuggerAttach(tabId);
+      // Paging the calendar with real keys is the nicer route, not the only one —
+      // the loop re-reads the month afterwards either way. An unguarded attach here
+      // turned "another extension holds the debugger" into a thrown error out of
+      // set_date, past the check that would have recovered.
       try {
-        const key = delta > 0 ? 'PageDown' : 'PageUp';
-        await cdpSend(tabId, 'Input.dispatchKeyEvent', {
-          type: 'keyDown', key, code: key,
-        });
-        await cdpSend(tabId, 'Input.dispatchKeyEvent', {
-          type: 'keyUp', key, code: key,
-        });
-      } finally {
-        await debuggerDetach(tabId);
-      }
+        await debuggerAttach(tabId);
+        try {
+          const key = delta > 0 ? 'PageDown' : 'PageUp';
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyDown', key, code: key,
+          });
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyUp', key, code: key,
+          });
+        } finally {
+          await debuggerDetach(tabId);
+        }
+      } catch { /* no debugger: the month is re-read below and paged another way */ }
     }
     navAttempts++;
     await new Promise(r => setTimeout(r, 90));
@@ -2559,7 +2818,10 @@ async function setCombobox(tabId, selector, values, opts = {}) {
       // always runs on one that is not — so the result is checked and the
       // native setter finishes the job when nothing arrived.
       const query = val.slice(0, Math.min(queryPrefixLen, val.length));
-      await debuggerAttach(tabId);
+      // Guarded for the same reason: the read-back below is what decides whether the
+      // query landed, and the native setter finishes the job when it did not. Failing
+      // to attach is one more way for nothing to arrive, not a reason to give up.
+      await debuggerAttach(tabId).catch(() => {});
       try { await cdpSend(tabId, 'Input.insertText', { text: query }); } catch {}
       let typed = await readBackValue(tabId, selector);
       if (typed !== query) {
@@ -4170,13 +4432,67 @@ async function dispatchCore(port, method, params) {
           });
           if (fb?.result?.ok) { method = 'native-setter-fallback'; after = await readField(); }
         }
+        // Same check as the selector path. This returned ok:true whatever landed,
+        // which is how a field ends up holding two values and reporting one.
+        const refVerdict = fillVerdict(after, params.value);
+        if (refVerdict === 'appended' || refVerdict === 'wrong') {
+          await focusAndClearElement(tab.id, target);
+          try {
+            await debuggerAttach(tab.id);
+            await cdpSend(tab.id, 'Input.insertText', { text: params.value });
+          } catch { /* the re-read below is what decides */ }
+          after = await readField();
+          const again = fillVerdict(after, params.value);
+          if (again === 'appended' || again === 'wrong') {
+            return {
+              ok: false,
+              method,
+              error: again === 'appended'
+                ? 'The value was added to what the field already held instead of replacing it. The field would not clear — usually a framework putting its own value back.'
+                : 'The field does not hold the value it was given.',
+              value_before: describe(before),
+              value_after: describe(after),
+              expected: params.value.length > 40 ? `[${params.value.length} chars]` : params.value,
+            };
+          }
+        }
         return { ok: true, method, value_before: describe(before), value_after: describe(after) };
       }
 
       // Always use debugger for input/textarea — React/Angular/Vue need real keyboard events
       try {
         await debuggerFill(tab.id, parsed.selector, params.value);
-        const after = await readField();
+        let after = await readField();
+
+        // Compare what landed against what was asked for. This returned ok:true
+        // unconditionally — it read the field back and then ignored the answer — so
+        // a field holding four stacked copies of an email address reported success
+        // four times, and the only thing that caught it was somebody reading a
+        // screenshot. A fill that cannot say the value is in the field is not a fill.
+        const verdict = fillVerdict(after, params.value);
+        if (verdict === 'appended' || verdict === 'wrong') {
+          // One retry, clearing with real keys first — the usual cause is a
+          // controlled input restoring its old value between the clear and the type.
+          await focusAndClearElement(tab.id, parsed.selector);
+          try {
+            await debuggerAttach(tab.id);
+            await cdpSend(tab.id, 'Input.insertText', { text: params.value });
+          } catch { /* verdict below reports it */ }
+          after = await readField();
+          const second = fillVerdict(after, params.value);
+          if (second === 'appended' || second === 'wrong') {
+            return {
+              ok: false,
+              method: 'debugger',
+              error: second === 'appended'
+                ? 'The value was added to what the field already held instead of replacing it. The field would not clear — this is usually a framework putting its own value back.'
+                : 'The field does not hold the value it was given.',
+              value_before: describe(before),
+              value_after: describe(after),
+              expected: params.value.length > 40 ? `[${params.value.length} chars]` : params.value,
+            };
+          }
+        }
         return { ok: true, method: 'debugger', value_before: describe(before), value_after: describe(after) };
       } catch (e) {
         // Fallback to executeScript if debugger fails
@@ -4413,8 +4729,15 @@ async function dispatchCore(port, method, params) {
         document.addEventListener('keydown', window.__bmcpKeySpy, true);
       });
 
-      await debuggerAttach(tab.id);
-      try {
+      // Another extension holding this tab's one debugger slot is not a reason to
+      // fail. Everything below is built for exactly that case and reports which way
+      // the key went — but the attach was unguarded, so it threw straight past a
+      // working fallback and took the whole call with it. Chrome allows one debugger
+      // client per tab, and on a machine with Claude in Chrome installed the slot is
+      // contested as a matter of course, not as a fault.
+      let haveDebugger = true;
+      try { await debuggerAttach(tab.id); } catch { haveDebugger = false; }
+      if (haveDebugger) try {
         await cdpSend(tab.id, 'Input.dispatchKeyEvent', {
           type: 'keyDown',
           key,
@@ -5039,9 +5362,21 @@ async function dispatchCore(port, method, params) {
         if (!r?.data) return { ok: false, error: 'Chrome returned no PDF data for this page.' };
         return { ok: true, data: r.data, content_type: 'application/pdf', bytes: Math.round(r.data.length * 0.75), source_url: tab.url, title: tab.title };
       } catch (e) {
+        // Printing is one of the few things with no route except CDP, so when the
+        // debugger is held elsewhere the honest answer is that this cannot be done
+        // here — said in those terms. Passing Chrome's own wording through made the
+        // one recoverable cause look like a printing fault.
+        const msg = String(e?.message || e);
+        if (/debugger|attach|different extension/i.test(msg)) {
+          return {
+            ok: false,
+            error: 'Cannot print this page: rendering a PDF needs the Chrome debugger, and another client currently holds it for this tab. Chrome allows one at a time.',
+            hint: 'Close DevTools on this tab or pause the other automation extension, then call browser_reattach_debugger. To keep the original file instead of a rendering of it, pass its URL with mode:"url".',
+          };
+        }
         return {
           ok: false,
-          error: `Print failed: ${e?.message || e}`,
+          error: `Print failed: ${msg}`,
           hint: 'If the tab is displaying a PDF rather than a web page, pass its URL with mode:"url" to download the original file instead.',
         };
       }
@@ -5932,6 +6267,32 @@ async function dispatchCore(port, method, params) {
       if (!expect || typeof expect !== 'object' || !Object.keys(expect).length) {
         return { ok: false, error: 'expect required: an object of label to value, for example {"Email":"a@b.com"}' };
       }
+
+      // Reload first, and the question changes from "is the page showing this" to
+      // "did the server keep it". Those are different questions and only the second
+      // one matters after a save: a form that still displays what was typed proves
+      // nothing, because the value it is showing may only ever have existed in the
+      // browser. Portals drop individual fields server-side while accepting the rest
+      // — a degree that reverts every time while everything around it persists — and
+      // the only way anybody has found to tell is to reload and look again. That was
+      // being done by hand after every save.
+      let reloaded = false;
+      if (params.reload) {
+        const before = tab.url;
+        await chrome.tabs.reload(tab.id, { bypassCache: true });
+        // Wait for the document to come back, rather than reading the outgoing one.
+        for (let i = 0; i < 60; i++) {
+          await new Promise(r => setTimeout(r, 250));
+          const t = await chrome.tabs.get(tab.id).catch(() => null);
+          if (t && t.status === 'complete') { reloaded = true; break; }
+        }
+        if (!reloaded) {
+          return { ok: false, error: `The page did not finish reloading, so whether these values survived cannot be told from here. It was on ${before}.` };
+        }
+        // Settle for anything that populates fields after load, which is most
+        // portals — reading too early sees an empty form and calls it data loss.
+        await new Promise(r => setTimeout(r, 600));
+      }
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id }, world: 'MAIN',
         args: [expect, params.selector || null, params.exact === true],
@@ -6006,8 +6367,14 @@ async function dispatchCore(port, method, params) {
         matched: r.checks.length - mismatched.length,
         mismatched: mismatched.length ? mismatched : undefined,
         checks: params.verbose ? r.checks : undefined,
-        ...(mismatched.length ? {
-          hint: 'The page is not showing what it was given. A control that did not re-render keeps the previous value, which a structural check cannot see.',
+        // What was actually established matters as much as the verdict. Read from
+        // the page as it stood is a weaker claim than read after a reload, and only
+        // the second says anything about the server.
+        ...(reloaded ? { after_reload: true } : {}),
+        ...(mismatched.length && reloaded ? {
+          hint: 'These did not survive a reload, so the server did not keep them however the page looked before. Portals do this to individual fields while accepting everything around them — re-enter just these and save again.',
+        } : mismatched.length ? {
+          hint: 'The page is not showing what it was given. A control that did not re-render keeps the previous value, which a structural check cannot see. Pass reload:true to find out whether the server kept it, which is a different question.',
         } : {}),
       };
     }
@@ -6229,7 +6596,14 @@ async function dispatchCore(port, method, params) {
 
     case 'network_log': {
       const tab = await getSessionTab(port);
-      await debuggerAttach(tab.id).catch(() => {}); // ensures Network.enable ran
+      // Bodies are captured through the debugger, so a failed attach means there
+      // are none to be had — and swallowing that returned entries without bodies,
+      // which reads as "these responses had no body" rather than "nothing was
+      // recording them". Asking for bodies and being quietly given none is the
+      // shape of every other silence in this codebase, and it made a failing check
+      // give no clue why.
+      let attachFailed = null;
+      await debuggerAttach(tab.id).catch((e) => { attachFailed = String(e?.message || e).split('\n')[0]; });
       const buf = networkLogs.get(tab.id) || [];
       const pat = params.url_pattern || '';
       // Other extensions' content scripts fetch their own assets through the page,
@@ -6281,8 +6655,12 @@ async function dispatchCore(port, method, params) {
       if (params.clear) networkLogs.set(tab.id, []);
       return {
         requests: out, total_matched: total, buffered: buf.length,
+        ...(attachFailed ? {
+          recording: false,
+          note: `Not recording this tab: ${attachFailed}. Anything below was captured earlier; nothing new is being added, and no response bodies are available. Another debugger client — DevTools, or a second extension — is the usual reason.`,
+        } : {}),
         ...(params.include_body ? {} : { hint: 'Entries marked has_body carry a captured response; pass include_body:true to read them.' }),
-        ...(buf.length === 0 ? { note: 'Empty — recording starts when the debugger attaches to a tab. Reload the page to capture its full load sequence.' } : {}),
+        ...(buf.length === 0 && !attachFailed ? { note: 'Empty — recording starts when the debugger attaches to a tab. Reload the page to capture its full load sequence.' } : {}),
       };
     }
 
@@ -6423,6 +6801,42 @@ async function dispatchCore(port, method, params) {
     }
 
     case 'reattach_debugger': {
+      // Treat the debugger as unavailable until told otherwise. Chrome allows one
+      // debugger client per tab, so on any machine with another automation extension
+      // installed the slot is contested as a matter of course — and every tool here
+      // has a fallback for that which, until now, only ran when the contention
+      // happened to occur during a test. It could not be reproduced on purpose, so
+      // three of those fallbacks were broken for an unknown length of time and were
+      // found by accident. This makes the condition something a test can ask for.
+      // Make Chrome's own calls stop answering, rather than fail. These are different
+      // faults and only one of them hung health for three and a half hours: a
+      // rejection is caught, a call that never returns is not. Without a way to ask
+      // for it, the deadline path could only be checked by waiting for the browser to
+      // wedge on its own, and a check that passes because the condition never arose
+      // reads exactly like a check that passed.
+      if (typeof params.wedge === 'boolean') {
+        pretendWedged = params.wedge;
+        await chrome.storage.session.set({ bmcpPretendWedged: params.wedge });
+        return {
+          ok: true,
+          wedged_simulation: params.wedge,
+          note: params.wedge
+            ? 'Chrome\'s debugger calls will now hang instead of answering, as they do when the debugger is wedged.'
+            : 'Chrome\'s debugger calls answer normally again.',
+        };
+      }
+      if (typeof params.disable === 'boolean') {
+        pretendNoDebugger = params.disable;
+        await chrome.storage.session.set({ bmcpPretendNoDebugger: params.disable });
+        if (params.disable) { try { await chrome.debugger.detach({ tabId: (await getSessionTab(port)).id }); } catch {} }
+        return {
+          ok: true,
+          debugger_disabled: params.disable,
+          note: params.disable
+            ? 'The debugger is now treated as unavailable. Tools will use their fallback paths, as they do when another extension holds the tab.'
+            : 'The debugger is available again.',
+        };
+      }
       // FORCE-GRAB recovery: activate the tab (input only reaches active tabs),
       // clear every stale claim, re-attach, then PROVE it by dispatching a real
       // mouse event and checking whether the page actually received it.
@@ -6754,6 +7168,18 @@ async function dispatchCore(port, method, params) {
       if (params.all) {
         const everything = await chrome.tabs.query({});
         const mine = session.tabIds;
+        // Who each tab actually belongs to. This used to be a straight either/or —
+        // mine, or "user" — so every tab held by another session was reported as the
+        // person's own. With more than one session open that is simply false, and it
+        // is false in the direction that matters: the hint below invites adopting a
+        // "user" tab, which would take a tab out from under another run mid-action.
+        const ownerOf = (tabId) => {
+          if (mine.has(tabId)) return session.adopted?.has(tabId) ? 'this-session (adopted)' : 'this-session';
+          for (const [p, s] of sessions) {
+            if (p !== port && s.tabIds?.has(tabId)) return `session ${s.label}`;
+          }
+          return 'user';
+        };
         const grouped = {};
         for (const t of everything) {
           const entry = {
@@ -6762,7 +7188,7 @@ async function dispatchCore(port, method, params) {
             title: t.title || '',
             active: t.active,
             window_id: t.windowId,
-            owner: mine.has(t.id) ? (session.adopted?.has(t.id) ? 'this-session (adopted)' : 'this-session') : 'user',
+            owner: ownerOf(t.id),
             attachable: !(t.url || '').startsWith('chrome://') && !(t.url || '').startsWith('chrome-extension://') && !(t.url || '').startsWith('edge://'),
           };
           (grouped[t.windowId] ||= []).push(entry);
@@ -6774,7 +7200,7 @@ async function dispatchCore(port, method, params) {
           windows: Object.keys(grouped).length,
           session: session.label,
           session_tabs: mine.size,
-          hint: 'browser_attach_tab({tab_id}) adopts one of the "user" tabs into this session so every tool acts on it. Adopted tabs are never auto-closed. Tabs with attachable:false (chrome://, extension pages) cannot be automated.',
+          hint: 'browser_attach_tab({tab_id}) adopts one of the "user" tabs into this session so every tool acts on it. Adopted tabs are never auto-closed. Tabs owned by another session are named as such and are in use by a run that is still going. Tabs with attachable:false (chrome://, extension pages) cannot be automated.',
         };
       }
 
@@ -7104,7 +7530,15 @@ async function dispatchCore(port, method, params) {
       const tab = await getSessionTab(port);
       const selector = params.selector || 'input[type="file"]';
       try {
-        await debuggerAttach(tab.id);
+        await debuggerAttach(tab.id).catch(async (attachErr) => {
+          // Chrome hands the debugger to one client per tab, so another automation
+          // extension holding it made attaching a file impossible — the one step
+          // that stops an otherwise unattended run, and it stops it at the end.
+          // The bytes are the only privileged part; the input itself can be
+          // populated from the page.
+          const viaPage = await uploadWithoutDebugger(tab.id, selector, params.files || [], params.files_b64);
+          throw Object.assign(new Error(attachErr.message), { viaPage });
+        });
         // Find the file input element
         const { result: nodeResult } = await cdpSend(tab.id, 'Runtime.evaluate', {
           expression: `(() => {
@@ -7151,13 +7585,19 @@ async function dispatchCore(port, method, params) {
             const el = document.querySelector(${JSON.stringify(selector)});
             if (!el) return { gone: true };
             const names = Array.from(el.files || []).map(f => f.name);
+            // Sizes, because DOM.setFileInputFiles does not check that the path
+            // exists: give it one that does not and the input still reports a file
+            // of that name, with no bytes behind it. Every upload test in this
+            // project passed for its whole history against a path that was not
+            // there, and the tool called it verified.
+            const sizes = Array.from(el.files || []).map(f => f.size);
             const err = (function() {
               const box = el.closest('form, div, section') || document.body;
               const t = (box.innerText || '').replace(/\\s+/g, ' ');
               const m = t.match(/[^.]*\\b(invalid|not allowed|too large|exceeds|unsupported|must be)\\b[^.]*/i);
               return m ? m[0].trim().slice(0, 160) : null;
             })();
-            return { names, count: names.length, error_text: err };
+            return { names, sizes, count: names.length, error_text: err };
           })()
         `);
         await debuggerDetach(tab.id);
@@ -7170,10 +7610,26 @@ async function dispatchCore(port, method, params) {
             files_attempted: files,
           };
         }
+        // A named file with no bytes is what a path that does not exist looks like
+        // from inside the page. Reporting that as attached is the false success this
+        // whole tool is supposed to prevent, and it is what it did.
+        const empty = (check.sizes || []).map((s, i) => (s === 0 ? check.names[i] : null)).filter(Boolean);
+        if (empty.length) {
+          return {
+            ok: false,
+            error: `The input holds ${empty.join(', ')} with no content. Chrome does not check that a path exists when a file is attached this way, so this is almost always a path that is not there.`,
+            files_attempted: files,
+            names: check.names,
+            sizes: check.sizes,
+          };
+        }
         return { ok: true, files: check.names, count: check.count, input: info, verified: true,
-                 ...(check.error_text ? { page_says: check.error_text } : {}) };
+                 bytes: check.sizes, ...(check.error_text ? { page_says: check.error_text } : {}) };
       } catch (e) {
         try { await debuggerDetach(tab.id); } catch {}
+        // The in-page route already ran and knows how it went; returning the attach
+        // error over the top of it would report a failure that did not happen.
+        if (e.viaPage) return e.viaPage;
         return { ok: false, error: e.message };
       }
     }
@@ -7711,17 +8167,58 @@ async function dispatchCore(port, method, params) {
 
     case 'health': {
       const session = getSession(port);
-      const tab = await getSessionTab(port);
+
+      // Every probe below gets a deadline, and a probe that does not answer is
+      // reported as not having answered.
+      //
+      // These were plain awaits in try/catch, which handles a rejection but not a
+      // hang — nothing that never settles is ever caught. When the debugger wedged,
+      // getTargets stopped returning and this whole command blocked until the
+      // server's 30s timeout killed it. From the caller's side "health timed out" is
+      // indistinguishable from "the extension is gone", so a session concluded the
+      // bridge was down and stopped: it repeated that at every tick for three and a
+      // half hours while the bridge was fine the entire time and one call to
+      // reattach_debugger fixed it in six seconds.
+      //
+      // A diagnostic that can hang is worse than no diagnostic. It is the one thing
+      // that must answer when everything else has stopped.
+      const probe = async (what, ms, fn) => {
+        let timer;
+        try {
+          return await Promise.race([
+            Promise.resolve().then(fn),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} did not answer within ${ms}ms`)), ms); }),
+          ]);
+        } finally { clearTimeout(timer); }
+      };
+
+      const notAnswering = [];
+      let tab;
+      try {
+        tab = await probe('finding this session\'s tab', 5000, () => getSessionTab(port));
+      } catch (e) {
+        notAnswering.push(String(e.message || e));
+        return {
+          ok: false,
+          error: 'Could not determine this session\'s tab.',
+          not_answering: notAnswering,
+          hint: 'The extension is reachable — this reply is proof of that — but Chrome is not answering about tabs. browser_list_browsers and browser_list_tabs do not depend on it.',
+        };
+      }
+
       let debuggerAttachedReal = false;
       try {
-        const targets = await chrome.debugger.getTargets();
+        const targets = await probe('chrome.debugger.getTargets', 4000,
+          () => (pretendWedged ? new Promise(() => {}) : chrome.debugger.getTargets()));
         debuggerAttachedReal = !!targets.find(t => t.tabId === tab.id)?.attached;
-      } catch {}
+      } catch (e) { notAnswering.push(String(e.message || e)); }
+
       let scriptingOk = false;
       try {
-        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => true });
+        const [r] = await probe('injecting a script into the page', 6000,
+          () => chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => true }));
         scriptingOk = r?.result === true;
-      } catch {}
+      } catch (e) { notAnswering.push(String(e.message || e)); }
       // The two reasons a page stops responding that are not faults at all: it is
       // asking for a person. Reported here so the answer arrives with the
       // diagnosis, rather than needing a separate call to go looking for it.
@@ -7739,6 +8236,10 @@ async function dispatchCore(port, method, params) {
       }
       return {
         ok: true,
+        // What did not answer, and what to do about it. A probe timing out is the
+        // signature of a wedged debugger, and the fix is one command — but only if
+        // the reply says so instead of never arriving.
+        ...(notAnswering.length ? { not_answering: notAnswering, wedged: true } : {}),
         active_tab: { id: tab.id, url: tab.url, title: tab.title },
         session: { label: session.label, color: session.color, tabs: session.tabIds.size },
         debugger_attached: debuggerAttachedReal,
@@ -7749,6 +8250,16 @@ async function dispatchCore(port, method, params) {
         // One machine here sat on a version from before a week of work without
         // anything ever saying so.
         extension_version: chrome.runtime.getManifest().version,
+        // And which source, which the version cannot tell you between releases.
+        source_fingerprint: await computeFingerprint(),
+        // Whether this extension may read local files. Attaching a file to an upload
+        // field without the debugger depends on it, and when it is off the failure
+        // looks like the file simply not attaching. Reported here so it can be checked
+        // rather than inferred from a failed upload.
+        file_access: await new Promise((resolve) => {
+          try { chrome.extension.isAllowedFileSchemeAccess((r) => resolve(!!r)); }
+          catch { resolve(null); } // API not available in this context
+        }),
         // An install with no update address will never update, whatever the
         // channel publishes, and nothing about it looks wrong from the outside —
         // it answers every command while running whatever it was installed with.
@@ -7768,7 +8279,11 @@ async function dispatchCore(port, method, params) {
         ...(captcha ? { captcha } : {}),
         ...(wall ? { auth_wall: { detected: wall.evidence, url: wall.url } } : {}),
         ...(recentCalls ? { recent: recentCalls } : {}),
-        hint: captcha ? 'A CAPTCHA is on the page. It cannot be solved from here, and it is there precisely to require a person — tell the user what is blocking the flow, let them clear it in the browser, then continue.' :
+        // A probe that stopped answering comes first, ahead of everything else this
+        // hint can say. It is the condition that stops a run dead, it is the one
+        // nothing else reports, and its fix is a single command.
+        hint: notAnswering.length ? `Chrome stopped answering some of its own calls (${notAnswering.join('; ')}), which is what a wedged debugger looks like. The bridge is fine — this reply came over it. Call browser_reattach_debugger to clear it, then carry on.` :
+              captcha ? 'A CAPTCHA is on the page. It cannot be solved from here, and it is there precisely to require a person — tell the user what is blocking the flow, let them clear it in the browser, then continue.' :
               wall ? `The page is asking for authentication (${wall.evidence}). Tell the user, let them sign in, then continue. Automation cannot get past this on its own.` :
               !scriptingOk ? (!tab.url || tab.url.startsWith('about:') || tab.url.startsWith('chrome://')
                 ? `Active tab is a blank placeholder (${tab.url || 'about:blank'}) — injection is impossible there by design, and this is NOT a fault. Navigate to a real page first.`
@@ -7827,6 +8342,34 @@ async function dispatchCore(port, method, params) {
 
 // Injected twice per press: first to ask whether the real key arrived, then, if
 // it did not, to deliver one in the page and report what it actually did.
+// Put files on a file input from inside the page, without the debugger.
+//
+// DOM.setFileInputFiles is the usual route and it needs CDP, which Chrome grants to
+// one client per tab — so on a machine with another automation extension installed,
+// attaching a file was simply impossible, and this is the one step that reliably
+// stops an unattended run at the very end, after all the typing is done.
+//
+// A file input's files list is settable from script through a DataTransfer, so the
+// only genuinely privileged part is reading the bytes, which the extension does.
+function bmcpAttachFiles(selector, parts) {
+  const el = document.querySelector(selector);
+  if (!el) return { found: false };
+  if (el.tagName !== 'INPUT' || el.type !== 'file') return { found: true, wrong_kind: `${el.tagName}[type=${el.type}]` };
+  const dt = new DataTransfer();
+  for (const p of parts) {
+    const bin = atob(p.b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    dt.items.add(new File([arr], p.name, { type: p.type || 'application/octet-stream' }));
+  }
+  el.files = dt.files;
+  // The events a page actually listens for. Assigning files fires nothing on its own,
+  // so a form that validates on change would never learn a file had arrived.
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { found: true, names: [...el.files].map((f) => f.name), count: el.files.length };
+}
+
 function bmcpKeyOutcome(key, modifiers, code, vk, deliver) {
   const active = () => {
     let el = document.activeElement;
