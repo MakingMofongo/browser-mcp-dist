@@ -123,14 +123,54 @@ function heartbeat() {
   }
 }
 
+// How many scans to skip before retrying a port that refused. Ports with no server
+// are the common case — the range is 20 wide and a machine usually runs a handful of
+// sessions — so retrying every one of them on every scan meant opening around
+// fourteen doomed sockets every couple of seconds, for ever.
+//
+// Each one allocates a WebSocket, arms a timeout, fails, and logs. That is a
+// constant load on a document Chrome is already throttling for being hidden, and it
+// is the same document the watchdog then judges for being slow to answer a ping. The
+// scan was making the page look dead and getting it replaced, which dropped every
+// session's connection at once.
+//
+// A port that refused a moment ago is very unlikely to have a server a moment later,
+// so back off: retry a quiet port roughly every half minute instead of constantly. A
+// new server is still found well inside the time it takes anyone to notice.
+// Backoff is measured in TIME, never in scans.
+//
+// Counting scans was wrong the moment the scan interval was not what it says on the
+// tin. This document is hidden, Chrome throttles hidden documents, and a "15 scan"
+// wait at one scan a minute is a quarter of an hour — so a session whose server
+// started inside a backed-off window sat disconnected while the extension served
+// every other port perfectly. The popup said four connected and one session said the
+// bridge was down, and both were telling the truth.
+//
+// A wall-clock deadline cannot be stretched by throttling. Ten seconds at most for a
+// port that has never answered, which is cheap enough to be invisible and short
+// enough that nobody waits for a new session.
+const MAX_RETRY_MS = 10_000;
+const nextAttempt = new Map();        // port → earliest time to try again
+
 function scanPorts() {
+  const now = Date.now();
   for (let port = BASE_PORT; port <= MAX_PORT; port++) {
     const existing = connections.get(port);
     if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
+      nextAttempt.delete(port);
       continue;
     }
+    if ((nextAttempt.get(port) || 0) > now) continue;
     tryConnect(port);
   }
+}
+
+function noteConnectFailed(port) {
+  nextAttempt.set(port, Date.now() + MAX_RETRY_MS);
+}
+
+function noteConnectSucceeded(port) {
+  nextAttempt.delete(port);
 }
 
 function tryConnect(port) {
@@ -149,6 +189,7 @@ function tryConnect(port) {
     clearTimeout(connectTimeout);
     connections.set(port, ws);
     noteAlive(port);
+    noteConnectSucceeded(port);
     console.log(`[Offscreen] Connected to MCP server on port ${port} (${connections.size} total)`);
     // v2.0 hello handshake, two-phase so it can NEVER be skipped:
     // 1) immediate hello with synchronously available data (the server merges
@@ -206,6 +247,9 @@ function tryConnect(port) {
 
   ws.onclose = () => {
     clearTimeout(connectTimeout);
+    // Closed without ever having opened: there is no server on this port, so back
+    // off before trying it again.
+    if (connections.get(port) !== ws) noteConnectFailed(port);
     if (connections.get(port) === ws) {
       connections.delete(port);
       health.delete(port);

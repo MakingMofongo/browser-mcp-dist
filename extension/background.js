@@ -79,6 +79,10 @@ function sessionIdentity(port) {
 }
 
 function getSession(port) {
+  // Any activity on this port proves the server is alive, which cancels a pending
+  // release. This is the reconnection signal: the offscreen document does not tell
+  // the worker it reconnected, it simply starts sending commands again.
+  cancelRelease(port);
   if (!sessions.has(port)) {
     const { label, color } = sessionIdentity(port);
     sessions.set(port, {
@@ -171,6 +175,30 @@ async function addTabToSession(port, tabId) {
   }
 
   persistSessions();
+}
+
+// Ports whose socket has closed but which may still come back. Releasing a session
+// closes its tabs, so that decision waits until the server has actually gone rather
+// than firing on every transport blip.
+const pendingRelease = new Map(); // port → timeout id
+const RELEASE_GRACE_MS = 90_000;
+
+function scheduleRelease(port) {
+  if (pendingRelease.has(port)) return;
+  console.warn(`[bmcp] port ${port} disconnected; holding its tabs for ${RELEASE_GRACE_MS / 1000}s in case it reconnects`);
+  pendingRelease.set(port, setTimeout(() => {
+    pendingRelease.delete(port);
+    console.warn(`[bmcp] port ${port} never came back; releasing its tabs`);
+    releaseSession(port);
+  }, RELEASE_GRACE_MS));
+}
+
+function cancelRelease(port) {
+  const t = pendingRelease.get(port);
+  if (t === undefined) return;
+  clearTimeout(t);
+  pendingRelease.delete(port);
+  console.log(`[bmcp] port ${port} reconnected; keeping its tabs`);
 }
 
 async function releaseSession(port) {
@@ -1970,9 +1998,32 @@ const MISS_KEY = 'bmcp_offscreen_misses';
 const getMisses = async () => (await chrome.storage.session.get(MISS_KEY))[MISS_KEY] || 0;
 const setMisses = (n) => chrome.storage.session.set({ [MISS_KEY]: n });
 
+/**
+ * A short, persistent record of things that break connections.
+ *
+ * Everything about why the bridge drops has been inferred so far — from a session's
+ * failures, minutes later, with no way to tell a replaced offscreen document from a
+ * document Chrome closed on its own from a service worker that was evicted. Three
+ * explanations in a row were argued from symptoms and two were wrong.
+ *
+ * So: write down what happens, when it happens, where it survives eviction. Small
+ * enough to cost nothing, durable enough to still be there when somebody asks.
+ */
+async function noteEvent(what, detail) {
+  try {
+    const { bmcpEvents = [] } = await chrome.storage.local.get({ bmcpEvents: [] });
+    bmcpEvents.push({ t: new Date().toISOString(), what, ...(detail ? { detail } : {}) });
+    await chrome.storage.local.set({ bmcpEvents: bmcpEvents.slice(-120) });
+  } catch {}
+}
+
 async function ensureOffscreen() {
   const existing = await chrome.offscreen.hasDocument();
   if (!existing) {
+    // The document is gone and nobody here closed it: either Chrome reclaimed it or
+    // this worker restarted. Either way every socket died with it, which is a
+    // disconnection every session felt.
+    await noteEvent('offscreen-missing-recreating');
     await chrome.offscreen.createDocument({
       url: 'offscreen.html',
       reasons: ['WORKERS'],
@@ -1987,9 +2038,22 @@ async function ensureOffscreen() {
   //
   // Ask it whether it is alive instead. Nothing answering means the page is gone
   // or its script has died, and neither recovers on its own — so it is replaced.
+  // Ten seconds, not two.
+  //
+  // This document is permanently hidden, which is exactly the case Chrome throttles
+  // hardest, and it is doing real work while being asked: a heartbeat across every
+  // open socket, plus a port scan. Two seconds is a plausible amount of time for a
+  // busy throttled page to be late, so the check was answering "dead" about a
+  // document that was fine — and the penalty for that answer is dropping every
+  // session's connection at once, which is what three sessions disconnecting
+  // together, over and over, actually was.
+  //
+  // A dead document does not become alive later, so waiting longer costs nothing
+  // but a slower recovery in the rare real case. Being wrong the other way costs
+  // every session.
   const alive = await Promise.race([
     chrome.runtime.sendMessage({ type: 'bmcp_offscreen_ping' }).then((r) => r?.alive === true).catch(() => false),
-    new Promise((r) => setTimeout(() => r(false), 2000)),
+    new Promise((r) => setTimeout(() => r(false), 10000)),
   ]);
 
   // Two strikes, because the costs are not symmetric: replacing the document drops
@@ -2000,10 +2064,14 @@ async function ensureOffscreen() {
   const verdict = self.bmcpHeartbeatPolicy.offscreenVerdict({ answered: alive, misses: await getMisses() });
   await setMisses(verdict.misses);
   if (!verdict.replace) {
-    if (!alive) console.warn('[bmcp] offscreen document did not answer; checking again before replacing it');
+    if (!alive) {
+      console.warn('[bmcp] offscreen document did not answer; checking again before replacing it');
+      await noteEvent('offscreen-missed-ping', `miss ${verdict.misses}`);
+    }
     return;
   }
   {
+    await noteEvent('offscreen-replacing', 'did not answer twice');
     try { await chrome.offscreen.closeDocument(); } catch {}
     try {
       await chrome.offscreen.createDocument({
@@ -2084,7 +2152,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'session_disconnect') {
-    releaseSession(msg.port);
+    // A closed socket is not a finished session, and the difference matters because
+    // releasing a session CLOSES ITS TABS.
+    //
+    // The offscreen document gets replaced whenever the watchdog decides it is not
+    // answering, and every connection closes at once when that happens. Each close
+    // arrived here and shut the session's tabs — so a run filling in a portal had
+    // the page closed underneath it, then reconnected a second later into an empty
+    // session reporting zero tabs. The work was not lost track of; it was destroyed.
+    //
+    // The server is a separate process that outlives the socket, and reconnection
+    // takes seconds. So wait: if nothing comes back for this port within the grace
+    // period, the session really is gone and its tabs can go. If it reconnects, the
+    // release is cancelled and the run carries on in the same tabs.
+    noteEvent('socket-closed', `port ${msg.port}`);
+    scheduleRelease(msg.port);
     return;
   }
 
@@ -8182,17 +8264,32 @@ async function dispatchCore(port, method, params) {
       //
       // A diagnostic that can hang is worse than no diagnostic. It is the one thing
       // that must answer when everything else has stopped.
+      // Distinguishes "did not answer" from "answered with an error", because only
+      // the first is a wedged debugger.
+      //
+      // The first version treated both the same, so injecting into about:blank —
+      // which is refused by design, instantly, with a clear message — was reported
+      // as a hang, wedged:true, and "call browser_reattach_debugger". That is wrong
+      // advice for a blank tab, and it displaced the correct hint that was already
+      // there. A rejection is an answer; it is only silence that means nothing is
+      // listening.
+      const TIMED_OUT = Symbol('timed-out');
       const probe = async (what, ms, fn) => {
         let timer;
         try {
-          return await Promise.race([
-            Promise.resolve().then(fn),
-            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} did not answer within ${ms}ms`)), ms); }),
+          const result = await Promise.race([
+            Promise.resolve().then(fn).catch((e) => { throw Object.assign(e instanceof Error ? e : new Error(String(e)), { answered: true }); }),
+            new Promise((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), ms); }),
           ]);
+          if (result === TIMED_OUT) {
+            throw Object.assign(new Error(`${what} did not answer within ${ms}ms`), { timedOut: true });
+          }
+          return result;
         } finally { clearTimeout(timer); }
       };
 
-      const notAnswering = [];
+      const notAnswering = [];   // silence: the signature of a wedged debugger
+      const probeErrors = [];    // answered, with an error — an ordinary fact to report
       let tab;
       try {
         tab = await probe('finding this session\'s tab', 5000, () => getSessionTab(port));
@@ -8211,14 +8308,14 @@ async function dispatchCore(port, method, params) {
         const targets = await probe('chrome.debugger.getTargets', 4000,
           () => (pretendWedged ? new Promise(() => {}) : chrome.debugger.getTargets()));
         debuggerAttachedReal = !!targets.find(t => t.tabId === tab.id)?.attached;
-      } catch (e) { notAnswering.push(String(e.message || e)); }
+      } catch (e) { if (e?.timedOut) notAnswering.push(String(e.message || e)); else probeErrors.push(String(e.message || e)); }
 
       let scriptingOk = false;
       try {
         const [r] = await probe('injecting a script into the page', 6000,
           () => chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => true }));
         scriptingOk = r?.result === true;
-      } catch (e) { notAnswering.push(String(e.message || e)); }
+      } catch (e) { if (e?.timedOut) notAnswering.push(String(e.message || e)); else probeErrors.push(String(e.message || e)); }
       // The two reasons a page stops responding that are not faults at all: it is
       // asking for a person. Reported here so the answer arrives with the
       // diagnosis, rather than needing a separate call to go looking for it.
@@ -8240,6 +8337,7 @@ async function dispatchCore(port, method, params) {
         // signature of a wedged debugger, and the fix is one command — but only if
         // the reply says so instead of never arriving.
         ...(notAnswering.length ? { not_answering: notAnswering, wedged: true } : {}),
+        ...(probeErrors.length ? { probe_errors: probeErrors } : {}),
         active_tab: { id: tab.id, url: tab.url, title: tab.title },
         session: { label: session.label, color: session.color, tabs: session.tabIds.size },
         debugger_attached: debuggerAttachedReal,
@@ -8250,6 +8348,19 @@ async function dispatchCore(port, method, params) {
         // One machine here sat on a version from before a week of work without
         // anything ever saying so.
         extension_version: chrome.runtime.getManifest().version,
+        // Which MCP servers this extension currently holds a socket to.
+        //
+        // "The popup says four connected but my session cannot reach it" was
+        // unanswerable from inside a session: every tool reported on this session
+        // only, so a session whose own port was the missing one saw a dead bridge
+        // while the extension was demonstrably alive and serving everyone else.
+        // Listing the ports makes that a five-second check instead of a hunt.
+        connected_ports: await chrome.storage.local.get({ mcpPorts: [] })
+          .then((r) => r.mcpPorts || []).catch(() => []),
+        // The last few things that broke connections, with times. Ask the extension
+        // what happened instead of reconstructing it from a session's failures.
+        recent_events: await chrome.storage.local.get({ bmcpEvents: [] })
+          .then((r) => (r.bmcpEvents || []).slice(-12)).catch(() => []),
         // And which source, which the version cannot tell you between releases.
         source_fingerprint: await computeFingerprint(),
         // Whether this extension may read local files. Attaching a file to an upload
