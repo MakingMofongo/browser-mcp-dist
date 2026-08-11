@@ -1088,6 +1088,155 @@ function fillVerdict(after, expected) {
   return 'wrong';
 }
 
+/**
+ * Scroll inside a specific element, with a real wheel where one is possible.
+ *
+ * Two things a virtualised list needs that setting scrollTop does not provide:
+ *
+ * 1. A trusted wheel event. WhatsApp, Slack and every react-window list load older
+ *    content from a wheel handler, not from a scroll position. Assigning scrollTop
+ *    moves the box and fetches nothing, which looks like scrolling that "works" and
+ *    loads no history — the exact wall a run hit paging back through a chat.
+ * 2. Honest reporting of whether anything moved AND whether anything arrived. A pane
+ *    already at the top cannot move, and that is a different answer from a pane that
+ *    moved but loaded nothing.
+ */
+/**
+ * Which elements on this page actually scroll, biggest first.
+ *
+ * Apps that scroll a pane rather than the document are the common case now — chat
+ * threads, mail lists, dashboards — and "the page did not move, pass a selector"
+ * leaves the caller to go and find that selector themselves. Each entry carries a
+ * selector that can be handed straight back to browser_scroll.
+ */
+async function findScrollables(tabId, limit = 4) {
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [limit],
+      func: (max) => {
+        const out = [];
+        for (const el of document.querySelectorAll('*')) {
+          // Cheap layout reads first. getComputedStyle is the expensive call here —
+          // running it on every element in the document cost a second on a page with
+          // a few thousand nodes, which the timing gate caught. Almost nothing has
+          // more scrollHeight than clientHeight, so testing that first skips the
+          // style lookup for the overwhelming majority.
+          const hidden = el.scrollHeight - el.clientHeight;
+          if (hidden < 200 || el.clientHeight < 100) continue;   // ignore trivial scrollers
+          const overflow = getComputedStyle(el).overflowY;
+          if (overflow !== 'auto' && overflow !== 'scroll') continue;
+          // A selector the caller can use without inventing one. id when there is
+          // one, otherwise a stable data attribute we add ourselves.
+          let sel = el.id ? `#${el.id}` : null;
+          if (!sel) {
+            const key = 'bmcpScroll' + out.length;
+            el.setAttribute('data-bmcp-scroll', key);
+            sel = `[data-bmcp-scroll="${key}"]`;
+          }
+          out.push({
+            selector: sel, tag: el.tagName.toLowerCase(),
+            scrollable_px: hidden, visible_px: el.clientHeight, at: el.scrollTop,
+          });
+        }
+        return out.sort((a, b) => b.scrollable_px - a.scrollable_px).slice(0, max);
+      },
+    });
+    return r?.result || [];
+  } catch { return []; }
+}
+
+async function scrollWithin(tabId, selector, dx, dy, params = {}) {
+  const measure = async () => {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [selector],
+      func: (sel) => {
+        const deep = (root) => {
+          let e = null;
+          try { e = sel.startsWith('ref_') ? (window.__bmcpRefEls || {})[sel] : root.querySelector(sel); } catch { return null; }
+          if (e) return e;
+          for (const n of root.querySelectorAll('*')) if (n.shadowRoot) { const f = deep(n.shadowRoot); if (f) return f; }
+          return null;
+        };
+        const e = deep(document);
+        if (!e) return null;
+        const b = e.getBoundingClientRect();
+        return {
+          top: e.scrollTop, height: e.scrollHeight, client: e.clientHeight,
+          children: e.childElementCount,
+          cx: Math.round(b.left + b.width / 2), cy: Math.round(b.top + b.height / 2),
+        };
+      },
+    });
+    return r?.result || null;
+  };
+
+  const before = await measure();
+  if (!before) return { ok: false, error: `Element not found: ${selector}` };
+  if (before.height <= before.client) {
+    return {
+      ok: false, error: `${selector} does not scroll — its content is not taller than the box.`,
+      scroll_height: before.height, client_height: before.client,
+      hint: 'The scrolling element is usually an ancestor or an inner pane. browser_find or read_page can help locate it.',
+    };
+  }
+
+  // Trusted wheel first: it is the only kind a lazy-loading list reacts to.
+  let path = 'wheel';
+  try {
+    await debuggerAttach(tabId);
+    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
+      type: 'mouseWheel', x: before.cx, y: before.cy, deltaX: dx, deltaY: dy,
+      pointerType: 'mouse',
+    });
+    await new Promise((r) => setTimeout(r, params.settle_ms || 450));
+  } catch {
+    path = 'assigned';
+  }
+
+  let after = await measure();
+  // The wheel did nothing (no debugger, or the page ignored it): move the box
+  // directly. Content will not lazy-load this way, and the reply says so.
+  if (after && after.top === before.top) {
+    await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [selector, dx, dy],
+      func: (sel, x, y) => {
+        const deep = (root) => {
+          let e = null;
+          try { e = sel.startsWith('ref_') ? (window.__bmcpRefEls || {})[sel] : root.querySelector(sel); } catch { return null; }
+          if (e) return e;
+          for (const n of root.querySelectorAll('*')) if (n.shadowRoot) { const f = deep(n.shadowRoot); if (f) return f; }
+          return null;
+        };
+        const e = deep(document);
+        if (e) { e.scrollTop += y; e.scrollLeft += x; }
+      },
+    });
+    await new Promise((r) => setTimeout(r, 250));
+    after = await measure();
+    if (after && after.top !== before.top) path = 'assigned';
+  }
+
+  const moved = after ? after.top - before.top : 0;
+  const grew = after ? after.height - before.height : 0;
+  if (!moved) {
+    const atEdge = dy < 0 ? before.top <= 0 : before.top + before.client >= before.height - 1;
+    return {
+      ok: false, moved: 0, position: before.top, path,
+      error: atEdge
+        ? `${selector} is already at the ${dy < 0 ? 'top' : 'bottom'}.`
+        : `${selector} did not move. Neither a wheel nor assigning scrollTop shifted it.`,
+      ...(atEdge && grew <= 0 && dy < 0 ? { hint: 'Nothing older loaded either. Lists that fetch on a wheel need the window focused for the wheel to be trusted.' } : {}),
+    };
+  }
+  return {
+    ok: true, moved, position: after.top, path,
+    // Whether older content arrived is the point of scrolling a virtualised list,
+    // and it is not the same question as whether the box moved.
+    content_grew: grew > 0 ? grew : 0,
+    ...(grew > 0 ? {} : { note: 'The pane moved but no new content loaded. If you are paging back through history, the list may need a trusted wheel, which requires the browser window to be in front.' }),
+  };
+}
+
 async function focusAndClearElement(tabId, selectorOrRef) {
   try {
     const [r] = await chrome.scripting.executeScript({
@@ -4858,6 +5007,18 @@ async function dispatchCore(port, method, params) {
       // doesn't need active tab. Re-activating on every scroll-call destabilizes debugger.
       const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
+      // A selector WITH a distance means "scroll inside this thing".
+      //
+      // It used to mean scrollIntoView whatever else was passed, so asking to move a
+      // message pane up by 2000px scrolled the page to reveal the pane, ignored the
+      // distance, and returned ok with verified:true. A run trying to page back
+      // through a WhatsApp thread got success four times while the pane never moved,
+      // then gave up and wrote its own DOM code — which is the tool failing at the
+      // one job it was called for.
+      if (params.selector && (params.y || params.x)) {
+        return await scrollWithin(tab.id, params.selector, params.x || 0, params.y || 0, params);
+      }
+
       // Scroll to element
       if (params.selector) {
         const el = await resolveElement(tab.id, params.selector);
@@ -4965,6 +5126,12 @@ async function dispatchCore(port, method, params) {
           error: atEnd
             ? (dy > 0 ? 'Already at the bottom of the page.' : 'Already at the top of the page.')
             : 'The page did not move. The scrollable part is probably an inner element — pass a selector instead of a pixel amount.',
+          // Say WHICH inner element, rather than leaving the caller to write DOM code
+          // to find it. On an app that scrolls a pane rather than the document — a
+          // chat thread, a mail list — "pass a selector instead" is true and useless
+          // on its own, and a run answered it by hand-rolling a querySelectorAll
+          // sweep, tagging the pane with an id, and calling back in.
+          ...(atEnd ? {} : { scrollable_elements: await findScrollables(tab.id) }),
         };
       }
       return { ok: true, moved, position: after.y, at_bottom: after.max > 0 && after.y >= after.max - 2,
@@ -6613,6 +6780,20 @@ async function dispatchCore(port, method, params) {
         return buf.filter(e => e.status === undefined && !e.failed && (now - (e.t0 || 0)) < 10000).length;
       };
 
+      // Which requests are holding it up. A bare count says the page is busy without
+      // saying with what, so the only way to act on it was to call network_log and
+      // cross-reference by hand — and the answer turned out to matter: the thing
+      // never completing was a request to a fixture server that had been shut down,
+      // which no amount of waiting was ever going to resolve.
+      const inflightUrls = () => {
+        const buf = networkLogs.get(tab.id) || [];
+        const now = Date.now();
+        return buf
+          .filter(e => e.status === undefined && !e.failed && (now - (e.t0 || 0)) < 10000)
+          .slice(-5)
+          .map(e => ({ url: String(e.url || '').slice(0, 120), type: e.type, waiting_ms: now - (e.t0 || now) }));
+      };
+
       let reason = 'timeout';
       let lastPending = inflight();
       let lastSpinner = null;
@@ -6667,6 +6848,7 @@ async function dispatchCore(port, method, params) {
         reason,
         waited_ms: waited,
         pending_requests: lastPending,
+        ...(lastPending > 0 ? { pending: inflightUrls() } : {}),
         ...(lastSpinner ? { blocked_by: 'spinner: ' + lastSpinner } : {}),
         ...(reason === 'timeout' ? {
           hint: lastSpinner
