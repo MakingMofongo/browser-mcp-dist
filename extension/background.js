@@ -251,7 +251,12 @@ async function getSessionTab(port) {
   // Remember our OWN about:blank placeholder so we reuse it instead of spawning another
   // on every read-only call before the first navigate (FIX-4: about:blank proliferation).
   let blankFallback = null;
-  const consider = (tab) => {
+  // `ours` = a tab this session already holds. The checks below exist to stop an
+  // UNKNOWN tab being adopted on no evidence; they are wrong when applied to a tab
+  // we opened ourselves, because a tab that is mid-navigation reports an empty url
+  // for a moment and would be thrown away for it — and then a fresh about:blank gets
+  // opened beside it. That is the stray blank tab appearing next to the real one.
+  const consider = (tab, ours = false) => {
     if (!tab) return false;
     // Chrome reports an empty url for a tab that is still committing a navigation,
     // and pendingUrl is where the destination lives until it does. An empty string
@@ -261,7 +266,8 @@ async function getSessionTab(port) {
     // read like debugger contention. Not knowing what a tab is has to disqualify it,
     // the same as knowing it is unusable.
     const url = tab.url || tab.pendingUrl || '';
-    if (!url) return false;
+    // A tab of ours with no readable url is loading, not unknown. Keep it.
+    if (!url) return ours;
     if (url.startsWith('chrome://')) return false;
     // A page belonging to an extension — ours or anyone's — cannot be driven:
     // Chrome refuses to attach a debugger to another extension's page, and every
@@ -277,7 +283,7 @@ async function getSessionTab(port) {
   if (session.activeTabId) {
     try {
       const tab = await chrome.tabs.get(session.activeTabId);
-      if (consider(tab)) target = tab;
+      if (consider(tab, true)) target = tab;
     } catch {
       const dead = session.activeTabId;   // FIX-17: capture id BEFORE nulling (was deleting null)
       session.activeTabId = null;
@@ -290,7 +296,7 @@ async function getSessionTab(port) {
     for (const tabId of session.tabIds) {
       try {
         const tab = await chrome.tabs.get(tabId);
-        if (consider(tab)) { session.activeTabId = tabId; target = tab; break; }
+        if (consider(tab, true)) { session.activeTabId = tabId; target = tab; break; }
       } catch {
         session.tabIds.delete(tabId);
       }
