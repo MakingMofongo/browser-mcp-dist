@@ -186,11 +186,33 @@ const RELEASE_GRACE_MS = 90_000;
 function scheduleRelease(port) {
   if (pendingRelease.has(port)) return;
   console.warn(`[bmcp] port ${port} disconnected; holding its tabs for ${RELEASE_GRACE_MS / 1000}s in case it reconnects`);
-  pendingRelease.set(port, setTimeout(() => {
+  pendingRelease.set(port, setTimeout(async () => {
     pendingRelease.delete(port);
+    // Closing tabs cannot be undone, so look before doing it: if the bridge has a
+    // live connection to this port right now, the server is there and the session
+    // is only quiet.
+    if (await portConnected(port)) {
+      console.log(`[bmcp] port ${port} is connected again; keeping its tabs`);
+      noteEvent('release-skipped', `port ${port} connected`);
+      return;
+    }
     console.warn(`[bmcp] port ${port} never came back; releasing its tabs`);
+    noteEvent('session-released', `port ${port}`);
     releaseSession(port);
   }, RELEASE_GRACE_MS));
+}
+
+// Whether the offscreen bridge holds an open socket to this port. Unknown counts as
+// connected: when the answer cannot be had, keeping tabs is the mistake that can
+// be put right.
+async function portConnected(port) {
+  try {
+    const r = await chrome.runtime.sendMessage({ type: 'bmcp_offscreen_ping' });
+    if (!r || !Array.isArray(r.ports)) return true;
+    return r.ports.includes(Number(port));
+  } catch {
+    return true;
+  }
 }
 
 function cancelRelease(port) {
@@ -2322,6 +2344,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // release is cancelled and the run carries on in the same tabs.
     noteEvent('socket-closed', `port ${msg.port}`);
     scheduleRelease(msg.port);
+    return;
+  }
+
+  if (msg.type === 'session_reconnect') {
+    cancelRelease(msg.port);
     return;
   }
 

@@ -9,7 +9,7 @@
  */
 
 const BASE_PORT = 9876;
-const MAX_PORT = 9895;
+const MAX_PORT = 9935; // matches the server's range (mcp-server/index.js); refused ports back off
 const connections = new Map(); // port → WebSocket
 
 /**
@@ -191,6 +191,11 @@ function tryConnect(port) {
     noteAlive(port);
     noteConnectSucceeded(port);
     console.log(`[Offscreen] Connected to MCP server on port ${port} (${connections.size} total)`);
+    // Tell the worker the server for this port is back. It is holding that session's
+    // tabs on a countdown since the socket dropped, and used to cancel it only when a
+    // command arrived — so a session waiting on a person (a QR to scan, an OTP) sent
+    // nothing, and its tabs were closed under it 90 seconds after any blip.
+    chrome.runtime.sendMessage({ type: 'session_reconnect', port }).catch(() => {});
     // v2.0 hello handshake, two-phase so it can NEVER be skipped:
     // 1) immediate hello with synchronously available data (the server merges
     //    repeated hellos, so a partial one is never wrong, only incomplete);
