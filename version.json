@@ -1,5 +1,5 @@
 {
-  "version": "2.4.59",
+  "version": "2.4.60",
   "extension_id": "apcaminghehhiafleljmdhjhfimndngf",
   "files": [
     "background.js",
@@ -8,6 +8,8 @@
     "icons/icon-128.png",
     "icons/icon-16.png",
     "icons/icon-48.png",
+    "label.html",
+    "label.js",
     "manifest.json",
     "offscreen.html",
     "offscreen.js",
