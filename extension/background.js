@@ -554,6 +554,33 @@ async function debuggerAttach(tabId) {
         ? ' Chrome reports this tab already has a debugger client, which is not us — only one is allowed at a time.'
         : ' Chrome does not report another client on this tab, so this is not ordinary contention.';
     } catch {}
+    // What is embedded in the page. Chrome refuses the attach when ANY frame of the tab
+    // is another extension's page, and webNavigation.getAllFrames (browser_list_frames)
+    // does not show those frames — on 15–17 Oct the WhatsApp tab failed this way four
+    // times with no visible culprit. A function (not a string) runs under a strict page
+    // CSP, so this works exactly when execute_script cannot.
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: () => {
+          const out = [];
+          const walk = (root) => root.querySelectorAll('*').forEach((e) => {
+            if (e.tagName === 'IFRAME' || e.tagName === 'EMBED' || e.tagName === 'OBJECT' || e.tagName === 'FRAME') {
+              out.push(`${e.tagName.toLowerCase()} ${(e.src || e.data || '(no src)').slice(0, 120)}`);
+            }
+            if (e.shadowRoot) walk(e.shadowRoot);
+          });
+          walk(document);
+          return { frame: location.href.slice(0, 80), embedded: out };
+        },
+      });
+      const found = results.flatMap((r) => (r.result?.embedded || []).map((x) => `${x} (in ${r.result.frame})`));
+      culprits += found.length
+        ? ` Embedded in the page: ${found.slice(0, 8).join('; ')}.`
+        : ' Nothing is embedded in the page DOM (no iframe/embed/object, shadow roots included).';
+    } catch (e) {
+      culprits += ` (could not list embedded frames: ${String(e?.message || e).slice(0, 80)})`;
+    }
   }
   throw new Error(
     `Debugger attach failed: tab ${tabId} is at ${what}. Chrome said: ${lastMsg}.${culprits} ` +
